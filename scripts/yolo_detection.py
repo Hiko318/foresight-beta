@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Argus - YOLO Detection Script
+Foresight - YOLO Detection Script
 This script handles SAR (Search and Rescue) mode detection using YOLO
 """
 
@@ -370,34 +370,34 @@ class StaticDetectionZones:
         return list(self.tracked_objects.values())
 
 class YOLODetector:
-    def __init__(self, model_name="yolo11m.pt", use_fallback=False):
+    def __init__(self, model_name="yolo11n.pt", use_fallback=False):  # Use nano model for speed
         self.model = None
         self.model_name = model_name
-        self.confidence_threshold = 0.05  # Lower threshold to detect more people
-        # Initialize object tracker for responsive detection
+        self.confidence_threshold = 0.15  # Lowered for higher detection rate - catch more partial humans
+        # Initialize object tracker for ultra-responsive detection
         self.tracker = ObjectTracker(
-            smoothing_factor=0.7,  # Reduced smoothing for more responsive detection
-            max_distance=100,
+            smoothing_factor=0.5,  # Minimal smoothing for maximum responsiveness
+            max_distance=80,
             frame_skip_interval=1,   # Process EVERY frame for maximum speed
-            grace_period_ms=150     # Shorter grace period for faster response
+            grace_period_ms=100     # Ultra-short grace period for instant response
         )
         self.use_fallback = use_fallback
         # ULTRA-HIGH FREQUENCY: No frame skipping - maximum detection speed
         self.detection_counter = 0
         
-        # Enhanced detection stabilization for flicker-free boxes
+        # Ultra-responsive detection for real-time performance
         self.previous_detections = []
         self.persistent_detections = {}  # Track detections across frames
-        self.smoothing_factor = 0.6  # Reduced smoothing for more responsive detection
-        self.min_confidence_diff = 0.15  # Minimum confidence change to update detection
-        self.detection_persistence = 10  # Shorter persistence for more responsive detection
-        self.min_confidence_for_new = 0.3  # Lower threshold for new detections to catch more people
+        self.smoothing_factor = 0.3  # Minimal smoothing for instant updates
+        self.min_confidence_diff = 0.1   # Lower threshold for faster updates
+        self.detection_persistence = 5   # Very short persistence for real-time response
+        self.min_confidence_for_new = 0.12  # Even lower threshold for maximum detection coverage
         
-        # Motion detection for screen stability
+        # Optimized motion detection for ultra-low latency
         self.prev_frame = None
-        self.motion_threshold = 30.0  # Threshold for detecting significant motion
+        self.motion_threshold = 10.0  # Ultra-sensitive motion detection for better coverage
         self.frame_buffer = []  # Buffer to store recent frames
-        self.buffer_size = 3  # Number of frames to buffer
+        self.buffer_size = 2  # Smaller buffer for lower latency
         self.motion_detected = False
         
         # GPU performance optimization settings
@@ -553,94 +553,116 @@ class YOLODetector:
             
             # Process every frame for real-time detection (removed FPS throttling)
             
-            # Run YOLO inference with maximum speed optimizations
-            # Aggressive frame resizing for real-time performance
+            # Enhanced multi-scale detection for improved detection rate
             height, width = frame.shape[:2]
-            # Use smaller resolution for maximum speed (320px for real-time)
-            target_size = 320  # Smaller size for faster processing
-            if width > target_size or height > target_size:
-                if width > height:
-                    scale = target_size / width
-                    new_width = target_size
-                    new_height = int(height * scale)
-                else:
-                    scale = target_size / height
-                    new_height = target_size
-                    new_width = int(width * scale)
-                frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            else:
-                frame_resized = frame
-                scale = 1.0
             
-            # Use model.track() with maximum GPU performance optimization
-            try:
-                if self.device == "cuda":
-                    # Maximum GPU performance tracking with FP16 and smaller image size
-                    results = self.model.track(
-                        frame_resized,
-                        persist=True,
-                        tracker='bytetrack.yaml',
-                        conf=self.confidence_threshold,
-                        iou=0.3,  # Lower IoU to allow overlapping detections in crowds
-                        verbose=False,
-                        imgsz=320,  # Smaller size for real-time processing
-                        half=True,  # Use FP16 for maximum speed
-                        device=self.device,
-                        max_det=100  # Increase max detections for crowds
-                    )
-                else:
-                    results = self.model.track(
-                        frame_resized,
-                        persist=True,
-                        tracker='bytetrack.yaml',
-                        conf=self.confidence_threshold,
-                        iou=0.3,  # Lower IoU for crowd detection
-                        verbose=False,
-                        imgsz=320,  # Smaller size for real-time processing
-                        max_det=100  # Increase max detections for crowds
-                    )
-            except:
-                # Fallback to regular detection with GPU optimization
-                if self.device == "cuda":
-                    results = self.model(frame_resized, conf=self.confidence_threshold, verbose=False, show=False, imgsz=320, half=True, device=self.device, max_det=100)
-                else:
-                    results = self.model(frame_resized, conf=self.confidence_threshold, verbose=False, show=False, imgsz=320, max_det=100)
+            # Multi-scale detection: try different resolutions for better coverage
+            detection_scales = [640, 416]  # Multiple scales for better detection
+            all_detections = []
             
-            detections = []
-            # Get first result (like reference code: results[0])
-            if results and len(results) > 0:
-                result = results[0]
-                boxes = result.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        # Get box coordinates
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        confidence = box.conf[0].cpu().numpy()
-                        class_id = int(box.cls[0].cpu().numpy())
-                        
-                        # Get tracking ID if available
-                        track_id = None
-                        if hasattr(box, 'id') and box.id is not None:
-                            track_id = int(box.id[0].cpu().numpy())
-                        
-                        # Scale coordinates back to original frame size
-                        if scale != 1.0:
-                            x1 = x1 / scale
-                            y1 = y1 / scale
-                            x2 = x2 / scale
-                            y2 = y2 / scale
-                        
-                        # Get class name from YOLO's built-in names (like reference)
-                        class_name = self.model.names[class_id] if class_id in self.model.names else f'class_{class_id}'
-                        
-                        detection = {
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                            'confidence': float(confidence),
-                            'class_id': class_id,
-                            'label': class_name,
-                            'track_id': track_id
-                        }
-                        detections.append(detection)
+            for target_size in detection_scales:
+                if width > target_size or height > target_size:
+                    if width > height:
+                        scale = target_size / width
+                        new_width = target_size
+                        new_height = int(height * scale)
+                    else:
+                        scale = target_size / height
+                        new_height = target_size
+                        new_width = int(width * scale)
+                    frame_resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                else:
+                    frame_resized = frame
+                    scale = 1.0
+                
+                # Enhanced preprocessing for better detection
+                # Apply histogram equalization for better contrast
+                frame_enhanced = cv2.convertScaleAbs(frame_resized, alpha=1.1, beta=10)
+                
+                # Use the enhanced frame for detection
+                frame_to_detect = frame_enhanced
+            
+                # Enhanced detection with improved NMS settings
+                try:
+                    if self.device == "cuda":
+                        # Enhanced GPU tracking with lower IoU for better detection coverage
+                        results = self.model.track(
+                            frame_to_detect,
+                            persist=True,
+                            tracker='bytetrack.yaml',
+                            conf=self.confidence_threshold,
+                            iou=0.3,  # Lower IoU for better detection of partial/overlapping humans
+                            verbose=False,
+                            imgsz=target_size,
+                            half=True,
+                            device=self.device,
+                            max_det=100,  # Increased for better coverage
+                            classes=[0],  # Only detect persons
+                            agnostic_nms=True,
+                            augment=True  # Enable test-time augmentation for better detection
+                        )
+                    else:
+                        results = self.model.track(
+                            frame_to_detect,
+                            persist=True,
+                            tracker='bytetrack.yaml',
+                            conf=self.confidence_threshold,
+                            iou=0.3,  # Lower IoU for better detection coverage
+                            verbose=False,
+                            imgsz=target_size,
+                            max_det=100,
+                            classes=[0],
+                            agnostic_nms=True,
+                            augment=True
+                        )
+                except:
+                    # Enhanced fallback detection
+                    if self.device == "cuda":
+                        results = self.model(frame_to_detect, conf=self.confidence_threshold, verbose=False, show=False, imgsz=target_size, half=True, device=self.device, max_det=100, classes=[0], agnostic_nms=True, augment=True)
+                    else:
+                        results = self.model(frame_to_detect, conf=self.confidence_threshold, verbose=False, show=False, imgsz=target_size, max_det=100, classes=[0], agnostic_nms=True, augment=True)
+            
+                scale_detections = []
+                # Process results from current scale
+                if results and len(results) > 0:
+                    result = results[0]
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            # Get box coordinates
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = box.conf[0].cpu().numpy()
+                            class_id = int(box.cls[0].cpu().numpy())
+                            
+                            # Get tracking ID if available
+                            track_id = None
+                            if hasattr(box, 'id') and box.id is not None:
+                                track_id = int(box.id[0].cpu().numpy())
+                            
+                            # Scale coordinates back to original frame size
+                            if scale != 1.0:
+                                x1 = x1 / scale
+                                y1 = y1 / scale
+                                x2 = x2 / scale
+                                y2 = y2 / scale
+                            
+                            # Get class name from YOLO's built-in names
+                            class_name = self.model.names[class_id] if class_id in self.model.names else f'class_{class_id}'
+                            
+                            detection = {
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': float(confidence),
+                                'class_id': class_id,
+                                'label': class_name,
+                                'track_id': track_id,
+                                'scale': target_size
+                            }
+                            scale_detections.append(detection)
+                
+                all_detections.extend(scale_detections)
+            
+            # Merge and deduplicate detections from multiple scales
+            detections = self._merge_multi_scale_detections(all_detections)
             
             self.last_detections = detections
             self.last_inference_time = current_time
@@ -649,6 +671,62 @@ class YOLODetector:
         except Exception as e:
             print(f"[ERROR] Detection failed: {e}")
             return getattr(self, 'last_detections', [])
+    
+    def _merge_multi_scale_detections(self, all_detections):
+        """Merge detections from multiple scales, removing duplicates and keeping best confidence"""
+        if not all_detections:
+            return []
+        
+        # Group detections by overlap (IoU > 0.5 means same object)
+        merged_detections = []
+        used_indices = set()
+        
+        for i, det1 in enumerate(all_detections):
+            if i in used_indices:
+                continue
+                
+            # Find all overlapping detections
+            overlapping = [det1]
+            used_indices.add(i)
+            
+            for j, det2 in enumerate(all_detections[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                    
+                # Calculate IoU between bounding boxes
+                iou = self._calculate_iou(det1['bbox'], det2['bbox'])
+                if iou > 0.5:  # Same object detected at different scales
+                    overlapping.append(det2)
+                    used_indices.add(j)
+            
+            # Keep detection with highest confidence
+            best_detection = max(overlapping, key=lambda x: x['confidence'])
+            merged_detections.append(best_detection)
+        
+        return merged_detections
+    
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union (IoU) of two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection area
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union area
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
     
     def detect(self, frame):
         """Simple YOLO detection matching reference code behavior"""
@@ -1145,22 +1223,42 @@ class YOLODetector:
 class ScreenCapture:
     def __init__(self, region=None):
         self.region = region  # (x, y, width, height)
+        # Performance optimizations
+        self.cached_monitor = None
+        self.frame_buffer = None
+        self.last_dimensions = None
         
     def capture_screen(self):
-        """Capture screen or specific region"""
+        """Optimized screen capture with caching for real-time performance"""
         try:
             import mss
             
-            with mss.mss() as sct:
+            # Cache monitor configuration for better performance
+            if self.cached_monitor is None:
                 if self.region:
                     x, y, width, height = self.region
-                    monitor = {"top": y, "left": x, "width": width, "height": height}
+                    self.cached_monitor = {"top": y, "left": x, "width": width, "height": height}
                 else:
-                    monitor = sct.monitors[1]  # Primary monitor
+                    with mss.mss() as sct:
+                        self.cached_monitor = sct.monitors[1]  # Primary monitor
+            
+            with mss.mss() as sct:
+                screenshot = sct.grab(self.cached_monitor)
                 
-                screenshot = sct.grab(monitor)
-                frame = np.array(screenshot)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                # Get current dimensions
+                current_dims = (screenshot.height, screenshot.width)
+                
+                # Pre-allocate buffer if needed
+                if self.last_dimensions != current_dims or self.frame_buffer is None:
+                    self.frame_buffer = np.empty((screenshot.height, screenshot.width, 4), dtype='uint8')
+                    self.last_dimensions = current_dims
+                
+                # Convert screenshot data to numpy array
+                frame_data = np.frombuffer(screenshot.bgra, dtype='uint8')
+                self.frame_buffer = frame_data.reshape((screenshot.height, screenshot.width, 4))
+                
+                # Optimized color conversion
+                frame = cv2.cvtColor(self.frame_buffer, cv2.COLOR_BGRA2BGR)
                 
                 return frame
         except ImportError:
@@ -1171,7 +1269,7 @@ class ScreenCapture:
             return None
 
 class WindowOverlay:
-    def __init__(self, window_title="Argus Phone Mirror"):
+    def __init__(self, window_title="Foresight Phone Mirror"):
         self.window_title = window_title
         self.hwnd = None
         self.overlay_hwnd = None
@@ -1314,9 +1412,14 @@ class WindowOverlay:
             self.overlay_hwnd = None
 
 class WindowCapture:
-    def __init__(self, window_title="Argus Phone Mirror"):
+    def __init__(self, window_title="Foresight Phone Mirror"):
         self.window_title = window_title
         self.hwnd = None
+        # Performance optimizations
+        self.cached_dc = None
+        self.cached_bitmap = None
+        self.cached_dimensions = None
+        self.frame_buffer = None
         
     def find_window(self):
         """Find window by title"""
@@ -1348,7 +1451,7 @@ class WindowCapture:
             return False
     
     def capture_window(self):
-        """Capture window content"""
+        """Optimized window capture with caching for real-time performance"""
         if not self.hwnd:
             if not self.find_window():
                 return None
@@ -1362,34 +1465,42 @@ class WindowCapture:
             left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
             width = right - left
             height = bottom - top
-            # print(f"[DEBUG] Window capture dimensions: {width}x{height}", flush=True)
+            current_dimensions = (width, height)
             
-            # Get window device context
-            hwndDC = win32gui.GetWindowDC(self.hwnd)
-            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-            saveDC = mfcDC.CreateCompatibleDC()
+            # Check if we need to recreate cached resources
+            if (self.cached_dimensions != current_dimensions or 
+                self.cached_dc is None or self.cached_bitmap is None):
+                
+                # Clean up old resources
+                self._cleanup_cache()
+                
+                # Create new cached resources
+                hwndDC = win32gui.GetWindowDC(self.hwnd)
+                self.mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+                self.cached_dc = self.mfcDC.CreateCompatibleDC()
+                
+                self.cached_bitmap = win32ui.CreateBitmap()
+                self.cached_bitmap.CreateCompatibleBitmap(self.mfcDC, width, height)
+                self.cached_dc.SelectObject(self.cached_bitmap)
+                
+                self.cached_dimensions = current_dimensions
+                self.hwndDC = hwndDC
+                
+                # Pre-allocate frame buffer for better performance
+                self.frame_buffer = np.empty((height, width, 4), dtype='uint8')
             
-            # Create bitmap
-            saveBitMap = win32ui.CreateBitmap()
-            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
-            saveDC.SelectObject(saveBitMap)
+            # Fast capture using cached resources
+            self.cached_dc.BitBlt((0, 0), (width, height), self.mfcDC, (0, 0), win32con.SRCCOPY)
             
-            # Copy window content
-            saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
+            # Optimized bitmap data extraction
+            bmpstr = self.cached_bitmap.GetBitmapBits(True)
             
-            # Convert to numpy array
-            bmpinfo = saveBitMap.GetInfo()
-            bmpstr = saveBitMap.GetBitmapBits(True)
+            # Convert bitmap data to numpy array
+            frame_data = np.frombuffer(bmpstr, dtype='uint8')
+            self.frame_buffer = frame_data.reshape((height, width, 4))
             
-            frame = np.frombuffer(bmpstr, dtype='uint8')
-            frame.shape = (height, width, 4)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-     
-            win32gui.DeleteObject(saveBitMap.GetHandle())
-            saveDC.DeleteDC()
-            mfcDC.DeleteDC()
-            win32gui.ReleaseDC(self.hwnd, hwndDC)
+            # Fast color conversion
+            frame = cv2.cvtColor(self.frame_buffer, cv2.COLOR_BGRA2BGR)
             
             return frame
             
@@ -1398,14 +1509,37 @@ class WindowCapture:
             return None
         except Exception as e:
             print(f"[ERROR] Window capture failed: {e}")
+            self._cleanup_cache()  # Clean up on error
             return None
+    
+    def _cleanup_cache(self):
+        """Clean up cached resources"""
+        try:
+            if hasattr(self, 'cached_bitmap') and self.cached_bitmap:
+                win32gui.DeleteObject(self.cached_bitmap.GetHandle())
+            if hasattr(self, 'cached_dc') and self.cached_dc:
+                self.cached_dc.DeleteDC()
+            if hasattr(self, 'mfcDC') and self.mfcDC:
+                self.mfcDC.DeleteDC()
+            if hasattr(self, 'hwndDC') and self.hwndDC:
+                win32gui.ReleaseDC(self.hwnd, self.hwndDC)
+        except:
+            pass  # Ignore cleanup errors
+        
+        self.cached_dc = None
+        self.cached_bitmap = None
+        self.cached_dimensions = None
+    
+    def __del__(self):
+        """Destructor to clean up resources"""
+        self._cleanup_cache()
 
 def main():
-    parser = argparse.ArgumentParser(description='Argus YOLO Detection')
+    parser = argparse.ArgumentParser(description='Foresight YOLO Detection')
     parser.add_argument('--source', default='screen', help='Source: screen, camera, window, or file path')
     parser.add_argument('--camera', type=int, default=0, help='Camera index')
     parser.add_argument('--region', default=None, help='Screen region: x,y,width,height')
-    parser.add_argument('--window-title', default='Argus Phone Mirror', help='Window title to capture')
+    parser.add_argument('--window-title', default='Foresight Phone Mirror', help='Window title to capture')
     parser.add_argument('--output', default=None, help='Output video file path')
     parser.add_argument('--show', action='store_true', help='Display detection window')
     parser.add_argument('--yolo-scrcpy-mode', action='store_true', help='YOLO scrcpy window mode')
@@ -1517,7 +1651,7 @@ def main():
             
             # Display if requested or in yolo-scrcpy-mode (but not if overlay mode)
             if (args.show or getattr(args, 'yolo_scrcpy_mode', False)) and not args.overlay:
-                cv2.imshow('Argus SAR Detection', frame_with_detections)
+                cv2.imshow('Foresight SAR Detection', frame_with_detections)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             elif args.overlay:

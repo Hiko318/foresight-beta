@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 
-class ArgusApp {
+class ForesightApp {
   constructor() {
     this.mainWindow = null;
     this.scrcpyWindow = null;
@@ -30,7 +30,7 @@ class ArgusApp {
         backgroundThrottling: false  // ChatGPT recommendation #7: Disable background throttling
       },
       icon: path.join(__dirname, '../assets/icon.png'),
-      title: 'Argus',
+      title: 'Foresight',
       resizable: true,
       minimizable: true,
       maximizable: true,
@@ -154,7 +154,7 @@ class ArgusApp {
         $found = $false
         
         foreach ($proc in $processes) {
-          if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+          if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
             $found = $true
             Add-Type -TypeDefinition '
               using System;
@@ -243,7 +243,7 @@ class ArgusApp {
          $found = $false
          
          foreach ($proc in $processes) {
-           if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+           if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
              $found = $true
              Add-Type -TypeDefinition '
                using System;
@@ -278,7 +278,7 @@ class ArgusApp {
              Start-Sleep -Milliseconds 300
              
              # Reposition to layer 2 after restore
-             $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+             $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
              if ($mainWindow) {
                [Win32API]::SetWindowPos($proc.MainWindowHandle, $mainWindow.MainWindowHandle, 1, 128, 1498, 937, 0x0040)
              } else {
@@ -332,7 +332,7 @@ class ArgusApp {
     // Alternative minimize method using different approach
     const psCommand = `
       Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($_.MainWindowTitle -eq "Foresight Phone Mirror") {
           $_.CloseMainWindow()
           Write-Host "Fallback minimize attempted"
         }
@@ -436,7 +436,7 @@ class ArgusApp {
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
       
       foreach ($proc in $processes) {
-        if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -491,7 +491,7 @@ class ArgusApp {
     const psCommand = `
       Add-Type -AssemblyName System.Windows.Forms
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
-      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
       
       foreach ($proc in $processes) {
         if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
@@ -538,10 +538,10 @@ class ArgusApp {
       const psCommand = `
         Add-Type -AssemblyName System.Windows.Forms
         $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
-        $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Argus"} | Select-Object -First 1
+        $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
         
         foreach ($proc in $processes) {
-          if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+          if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
             Add-Type -TypeDefinition '
               using System;
               using System.Runtime.InteropServices;
@@ -702,7 +702,7 @@ class ArgusApp {
       
       // Start scrcpy process with calculated position and VSync settings
       this.scrcpyProcess = spawn('scrcpy', [
-        '--window-title=Argus Phone Mirror',
+        '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
         `--window-width=${winWidth}`,
@@ -797,8 +797,8 @@ class ArgusApp {
     console.log('Starting YOLO scrcpy window...');
     this.mainWindow.webContents.send('console-log', 'Starting YOLO scrcpy window...');
     
-    console.log('SAR mode will capture Argus Phone Mirror window content');
-    this.mainWindow.webContents.send('console-log', 'SAR mode capturing window: Argus Phone Mirror');
+    console.log('SAR mode will capture Foresight Phone Mirror window content');
+    this.mainWindow.webContents.send('console-log', 'SAR mode capturing window: Foresight Phone Mirror');
     
     // First, start scrcpy if not already running
     if (!this.scrcpyProcess) {
@@ -811,7 +811,7 @@ class ArgusApp {
       const scrcpyY = 128;
       
       this.scrcpyProcess = spawn('scrcpy', [
-        '--window-title=Argus Phone Mirror',
+        '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
         `--window-width=${winWidth}`,
@@ -864,7 +864,7 @@ class ArgusApp {
        this.yoloProcess = spawn('python', [
          scriptPath,
          '--source=window',
-         '--window-title=Argus Phone Mirror'
+         '--window-title=Foresight Phone Mirror'
        ], {
          cwd: path.join(__dirname, '..'),
          stdio: ['pipe', 'pipe', 'pipe']
@@ -988,7 +988,7 @@ class ArgusApp {
       
       foreach ($proc in $processes) {
         $windows = $proc.MainWindowTitle
-        if ($windows -like "*Argus SAR Detection*" -or $windows -eq "Argus SAR Detection") {
+        if ($windows -like "*Foresight SAR Detection*" -or $windows -eq "Foresight SAR Detection") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -1144,30 +1144,30 @@ class ArgusApp {
 }
 
 // App initialization
-console.log('Initializing Argus App...');
-const argusApp = new ArgusApp();
+console.log('Initializing Foresight App...');
+const foresightApp = new ForesightApp();
 
 app.whenReady().then(() => {
   console.log('Electron app ready - creating main window...');
-  argusApp.createMainWindow();
-  argusApp.setupIpcHandlers();
+  foresightApp.createMainWindow();
+  foresightApp.setupIpcHandlers();
   console.log('App initialization complete');
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       console.log('App activated - creating new window...');
-      argusApp.createMainWindow();
+      foresightApp.createMainWindow();
     }
   });
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    argusApp.cleanup();
+    foresightApp.cleanup();
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
-  argusApp.cleanup();
+  foresightApp.cleanup();
 });

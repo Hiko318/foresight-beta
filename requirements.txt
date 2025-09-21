@@ -1,4 +1,4 @@
-# Python dependencies for Argus YOLO detection
+# Python dependencies for Foresight YOLO detection
 opencv-python==4.8.1.78
 numpy==1.24.3
 mss==10.1.0

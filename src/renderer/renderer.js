@@ -1,6 +1,6 @@
 const { ipcRenderer } = require('electron');
 
-class ArgusRenderer {
+class ForesightRenderer {
     constructor() {
         this.isCapturing = false;
         this.sarModeEnabled = false;
@@ -218,7 +218,7 @@ class ArgusRenderer {
 
 // Initialize the renderer when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    const app = new ArgusRenderer();
+    const app = new ForesightRenderer();
     
     // Request initial status
     setTimeout(() => {
@@ -226,6 +226,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 500);
     
     // Log startup
-    app.logToConsole('Argus initialized', 'success');
+    app.logToConsole('Foresight initialized', 'success');
     app.logToConsole('Ready for phone capture and SAR detection', 'info');
 });
