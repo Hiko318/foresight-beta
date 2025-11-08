@@ -95,6 +95,50 @@ npm start
 npm run build
 ```
 
+## Training a Custom Human Detector (COCO + VisDrone + KAIST)
+
+Foresight uses Ultralytics YOLOv8 for detection. You can train a person-only model by merging COCO2017, VisDrone2019-DET, and KAIST Multispectral Pedestrian datasets.
+
+### Setup
+- Python 3.9+ with CUDA-capable GPU recommended
+- Install dependencies:
+  ```bash
+  pip install ultralytics pycocotools opencv-python tqdm
+  ```
+
+### Prepare datasets
+1. COCO2017: download `train2017`, `val2017`, and `annotations`.
+2. VisDrone2019-DET: ensure `images/train`, `images/val`, `annotations/train`, `annotations/val`.
+3. KAIST: arrange as
+   - `images/train`, `images/val`
+   - `annotations/train`, `annotations/val` containing txt files with lines: `filename x y w h` (person boxes).
+
+Run the converter:
+```bash
+py -3 foresight-beta/scripts/prepare_human_datasets.py ^
+  --coco-root C:\data\coco2017 ^
+  --visdrone-root C:\data\VisDrone2019-DET ^
+  --kaist-root C:\data\KAIST ^
+  --out-root C:\data
+```
+
+This builds `C:\data\datasets\foresight-human` in YOLO format.
+
+### Train YOLOv8
+```bash
+python -m ultralytics yolo detect/train ^
+  data=foresight-beta/datasets/foresight-human.yaml ^
+  model=yolov8n.yaml imgsz=640 epochs=50 batch=16 device=0
+```
+
+Tips:
+- KAIST thermal/grayscale images are expanded to 3-channel automatically.
+- VisDrone categories used: pedestrian(1), person(4), people(5).
+- COCO `iscrowd` annotations are skipped.
+- Mix day/night KAIST for better low-light performance.
+
+After training, copy your `best.pt` to `foresight-beta/assets/models/` and point `scripts/yolo_detection.py` to the new weights.
+
 ## How It Works
 
 ### Main Control Panel

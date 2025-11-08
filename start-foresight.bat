@@ -128,6 +128,32 @@ if exist "%VENV_DIR%\Scripts\activate.bat" (
 )
 
 REM --------------------------------------------------------------
+REM Verify critical Python packages and auto-install if missing
+REM --------------------------------------------------------------
+echo Checking critical Python packages...
+
+REM OpenCV (cv2)
+py -3 -c "import cv2" >nul 2>&1
+if errorlevel 1 (
+  echo Installing OpenCV (opencv-python)...
+  py -3 -m pip install opencv-python
+)
+
+REM Ultralytics
+py -3 -c "import ultralytics" >nul 2>&1
+if errorlevel 1 (
+  echo Installing Ultralytics YOLOv8...
+  py -3 -m pip install ultralytics
+)
+
+REM Torch (CPU fallback if missing)
+py -3 -c "import torch" >nul 2>&1
+if errorlevel 1 (
+  echo Installing PyTorch (CPU wheels)... This may take a few minutes.
+  py -3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+)
+
+REM --------------------------------------------------------------
 REM Node dependencies
 REM --------------------------------------------------------------
 if exist package-lock.json (

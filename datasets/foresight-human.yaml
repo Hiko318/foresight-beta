@@ -1,0 +1,6 @@
+path: datasets/foresight-human
+train: images/train
+val: images/val
+test: images/val
+names:
+  - person
