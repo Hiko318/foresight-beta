@@ -73,12 +73,14 @@
             <!-- Right Side Panel (empty by default, gallery can take over full height) -->
             <div class="console-panel-right">
                 <!-- Full-height Gallery (covers console when open) -->
-                <div id="galleryMain" class="gallery-main">
+                    <div id="galleryMain" class="gallery-main">
                     <div class="gallery-header">
                         <h4>Detected Gallery</h4>
                         <div class="gallery-actions">
+                            <button id="setGalleryFolder" class="btn btn-small">Set Folder</button>
                             <button id="refreshGallery" class="btn btn-small">Refresh</button>
                         </div>
+                        <div id="galleryDirPath" class="gallery-path">Folder: Not set</div>
                     </div>
                     <div id="galleryGrid" class="gallery-body gallery-grid"></div>
                 </div>

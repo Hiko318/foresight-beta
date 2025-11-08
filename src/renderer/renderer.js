@@ -52,6 +52,8 @@ class ForesightRenderer {
         this.galleryMain = document.getElementById('galleryMain');
         this.galleryGrid = document.getElementById('galleryGrid');
         this.refreshGalleryBtn = document.getElementById('refreshGallery');
+        this.setGalleryFolderBtn = document.getElementById('setGalleryFolder');
+        this.galleryDirPath = document.getElementById('galleryDirPath');
 
         // Image preview modal
         this.imagePreview = document.getElementById('imagePreview');
@@ -143,6 +145,13 @@ class ForesightRenderer {
         this.refreshGalleryBtn.addEventListener('click', () => {
             this.requestDetectedImages();
         });
+
+        // Set gallery folder (same as choosing face save directory)
+        if (this.setGalleryFolderBtn) {
+            this.setGalleryFolderBtn.addEventListener('click', () => {
+                ipcRenderer.send('choose-face-save-dir');
+            });
+        }
 
         // Gallery image click -> open preview
         this.galleryGrid.addEventListener('click', (e) => {
@@ -248,6 +257,11 @@ class ForesightRenderer {
         // Face save folder updates
         ipcRenderer.on('face-save-dir', (event, dirPath) => {
             this.faceSavePathDisplay.textContent = dirPath || 'Not set';
+            if (this.galleryDirPath) {
+                this.galleryDirPath.textContent = `Folder: ${dirPath || 'Not set'}`;
+            }
+            // Reload gallery from the new folder
+            this.requestDetectedImages();
         });
 
         // Notification when a face has been saved
@@ -260,6 +274,9 @@ class ForesightRenderer {
         // Detected images payload
         ipcRenderer.on('detected-images', (event, payload) => {
             const { dir, files } = payload || { dir: '', files: [] };
+            if (this.galleryDirPath) {
+                this.galleryDirPath.textContent = `Folder: ${dir || 'Not set'}`;
+            }
             this.renderGallery(dir, files);
         });
     }
