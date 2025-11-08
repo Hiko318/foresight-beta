@@ -1,6 +1,7 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const { spawn, exec } = require('child_process');
+const { initDetectionDatabase, logDetection, getRecentDetections, closeDetectionDatabase } = require('./db');
 
 class ForesightApp {
   constructor() {
@@ -11,11 +12,21 @@ class ForesightApp {
     this.scrcpyProcess = null;
     this.isCapturing = false;
     this.sarModeEnabled = false;
+    this.detectionLoggingEnabled = false;
+    this.faceSaveDir = null; // User-configurable save folder for verified faces
     this.childWindows = [];
     this.scrcpyWindowState = 'normal'; // Track scrcpy window state: 'normal', 'minimized', 'hidden'
     this.mainWindowState = 'normal'; // Track main window state
     this.scrcpyFocused = false; // Track if scrcpy window is focused
     this.focusMonitorInterval = null; // Interval for monitoring focus
+    // Embed scrcpy state
+    this.phoneMirrorBounds = null;
+    this.embedScrcpyEnabled = true;
+    this.embedMonitorInterval = null;
+    this.lastEmbedErrorTs = 0;
+    // Gallery watcher
+    this.galleryWatcher = null;
+    this.galleryWatchDir = null;
   }
 
   createMainWindow() {
@@ -29,7 +40,7 @@ class ForesightApp {
         enableRemoteModule: true,
         backgroundThrottling: false  // ChatGPT recommendation #7: Disable background throttling
       },
-      icon: path.join(__dirname, '../assets/icon.png'),
+      icon: path.join(__dirname, '../assets/icon.ico'),
       title: 'Foresight',
       resizable: true,
       minimizable: true,
@@ -354,10 +365,13 @@ class ForesightApp {
 
   setupWindowTracking() {
     if (!this.mainWindow || !this.isCapturing) return;
-    
-    // Set up window positioning with multiple attempts
+    // Skip legacy window positioning when embedding is enabled
+    if (this.embedScrcpyEnabled) {
+      this.mainWindow.webContents.send('console-log', 'Embedding mode enabled - skipping legacy scrcpy layering');
+      return;
+    }
+    // Legacy: external window positioning
     this.positionScrcpyWindow();
-    
     this.mainWindow.webContents.send('console-log', 'Window layering enabled - scrcpy on layer 2, main app on layer 1');
   }
   
@@ -602,7 +616,7 @@ class ForesightApp {
       Add-Type -AssemblyName System.Windows.Forms
       $processes = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue
       foreach ($proc in $processes) {
-        if ($proc.MainWindowTitle -eq "Argus Phone Mirror") {
+        if ($proc.MainWindowTitle -eq "Foresight Phone Mirror") {
           Add-Type -TypeDefinition '
             using System;
             using System.Runtime.InteropServices;
@@ -687,7 +701,10 @@ class ForesightApp {
       }
       
       // Device found, start scrcpy
-      this.mainWindow.webContents.send('console-log', `Device detected: ${devices[0].split('\t')[0]}`);
+      // Robustly parse device id: split on any whitespace and take the first token
+      const deviceLine = devices[0].trim();
+      const deviceId = deviceLine.split(/\s+/)[0];
+      this.mainWindow.webContents.send('console-log', `Device detected: ${deviceId}`);
       this.mainWindow.webContents.send('console-log', 'Starting screen mirror...');
       
       this.isCapturing = true;
@@ -702,6 +719,7 @@ class ForesightApp {
       
       // Start scrcpy process with calculated position and VSync settings
       this.scrcpyProcess = spawn('scrcpy', [
+        '-s', deviceId,
         '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
@@ -713,10 +731,27 @@ class ForesightApp {
         '--max-fps=30'  // ChatGPT Fix #5: Tame FPS for stability (30 FPS reduces flicker)
       ]);
       
-      // Set up window tracking after a delay to ensure scrcpy window is created
+      // After scrcpy initializes, embed it into the control panel
       setTimeout(() => {
-        this.setupWindowTracking();
+        if (this.embedScrcpyEnabled) {
+          this.embedScrcpyWindow();
+          this.startEmbedMonitor();
+        } else {
+          this.setupWindowTracking();
+        }
       }, 2000);
+
+      // Forward scrcpy logs for easier diagnostics
+      if (this.scrcpyProcess.stdout) {
+        this.scrcpyProcess.stdout.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy: ${data.toString()}`);
+        });
+      }
+      if (this.scrcpyProcess.stderr) {
+        this.scrcpyProcess.stderr.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy error: ${data.toString()}`);
+        });
+      }
 
       this.scrcpyProcess.on('error', (error) => {
         console.error('Scrcpy error:', error);
@@ -730,6 +765,7 @@ class ForesightApp {
         this.isCapturing = false;
         this.mainWindow.webContents.send('console-log', 'Screen mirror stopped.');
         this.mainWindow.webContents.send('capture-stopped');
+        this.stopEmbedMonitor();
       });
 
       // Notify renderer
@@ -749,6 +785,7 @@ class ForesightApp {
     // Remove window tracking listeners
     this.mainWindow.removeAllListeners('move');
     this.mainWindow.removeAllListeners('resize');
+    this.stopEmbedMonitor();
     
     // Clear synchronization monitor
     this.clearSynchronizationMonitor();
@@ -837,6 +874,7 @@ class ForesightApp {
         }
         this.sarModeEnabled = false;
         this.mainWindow.webContents.send('sar-stopped');
+        this.stopEmbedMonitor();
         // Close overlay window when scrcpy stops
         if (this.overlayWindow) {
           this.overlayWindow.close();
@@ -855,69 +893,129 @@ class ForesightApp {
     }
     
     // Wait for scrcpy window to be created, then start YOLO
-     setTimeout(() => {
-       const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
-       console.log(`Starting YOLO with script: ${scriptPath}`);
-       this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
-       
-       // Start YOLO without overlay flag - we'll use Electron overlay instead
-       this.yoloProcess = spawn('python', [
-         scriptPath,
-         '--source=window',
-         '--window-title=Foresight Phone Mirror'
-       ], {
-         cwd: path.join(__dirname, '..'),
-         stdio: ['pipe', 'pipe', 'pipe']
-       });
-       
-       // Parse YOLO detection data and send to overlay
-       this.yoloProcess.stdout.on('data', (data) => {
-         const output = data.toString();
-         console.log(`YOLO stdout: ${output}`);
-         
-         // Parse detection data from YOLO output
-         try {
-           const lines = output.split('\n');
-           for (const line of lines) {
-             if (line.includes('DETECTION_DATA:')) {
-               const detectionData = JSON.parse(line.replace('DETECTION_DATA:', ''));
-               // Send detection data to overlay window
-               if (this.overlayWindow) {
-                 this.overlayWindow.webContents.send('yolo-detections', detectionData);
-               }
-             }
-           }
-         } catch (e) {
-           // Ignore parsing errors for non-JSON output
-         }
-         
-         // Only send important messages to UI, not debug spam
-         if (output.includes('[ERROR]') || output.includes('YOLO model initialized')) {
-           this.mainWindow.webContents.send('console-log', `YOLO: ${output.trim()}`);
-         }
-       });
-        
-        // Log YOLO stderr for debugging (console only, not UI)
-        this.yoloProcess.stderr.on('data', (data) => {
-          const output = data.toString();
-          console.error(`YOLO stderr: ${output}`);
-          // Only send actual errors to UI
-          this.mainWindow.webContents.send('console-log', `YOLO Error: ${output.trim()}`);
+    setTimeout(() => {
+      if (this.embedScrcpyEnabled) {
+        this.embedScrcpyWindow();
+        this.startEmbedMonitor();
+      }
+      const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
+      console.log(`Starting YOLO with script: ${scriptPath}`);
+      this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
+
+      const workingDir = path.join(__dirname, '..');
+      const baseArgs = [
+        scriptPath,
+        '--source=window',
+        '--window-title=Foresight Phone Mirror'
+      ];
+
+      // Pass face save configuration to YOLO
+      if (this.faceSaveDir) {
+        baseArgs.push('--enable-face-save');
+        baseArgs.push(`--face-save-dir=${this.faceSaveDir}`);
+      }
+
+      // Attach logging from a process to UI
+      const attachYoloLogs = (proc) => {
+        if (proc.stdout) {
+          proc.stdout.on('data', (data) => {
+            const output = data.toString();
+            console.log(`YOLO stdout: ${output}`);
+            try {
+              const lines = output.split('\n');
+              for (const line of lines) {
+                if (line.includes('DETECTION_DATA:')) {
+                  const detectionData = JSON.parse(line.replace('DETECTION_DATA:', ''));
+                  if (this.overlayWindow) {
+                    this.overlayWindow.webContents.send('yolo-detections', detectionData);
+                  }
+                  // Conditionally log detection type to SQLite
+                  if (this.detectionLoggingEnabled) {
+                    try {
+                      let detectionType = 'unknown';
+                      if (Array.isArray(detectionData)) {
+                        const first = detectionData[0] || {};
+                        detectionType = first.type || first.label || 'unknown';
+                      } else if (typeof detectionData === 'object' && detectionData) {
+                        detectionType = detectionData.type || detectionData.label || 'unknown';
+                      }
+                      logDetection(detectionType);
+                      // Announce to renderer for live updates
+                      this.mainWindow && this.mainWindow.webContents.send('detection-logged', {
+                        type: detectionType,
+                        timestamp: new Date().toISOString()
+                      });
+                    } catch (_) {}
+                  }
+                } else if (line.startsWith('FACE_SAVED:')) {
+                  const savedPath = line.replace('FACE_SAVED:', '').trim();
+                  this.mainWindow && this.mainWindow.webContents.send('console-log', `Face saved: ${savedPath}`);
+                  this.mainWindow && this.mainWindow.webContents.send('face-saved', { path: savedPath, timestamp: new Date().toISOString() });
+                }
+              }
+            } catch (_) {}
+            // Forward YOLO info and error logs to console
+            if (output.includes('[ERROR]') || output.includes('YOLO model initialized')) {
+              this.mainWindow.webContents.send('console-log', `YOLO: ${output.trim()}`);
+            }
+          });
+        }
+        if (proc.stderr) {
+          proc.stderr.on('data', (data) => {
+            const output = data.toString();
+            console.error(`YOLO stderr: ${output}`);
+            this.mainWindow.webContents.send('console-log', `YOLO Error: ${output.trim()}`);
+          });
+        }
+      };
+
+      // Prefer Python 3.9 explicitly to avoid TF/Keras version issues
+      // Remove generic 'python' fallback; try 'py -3.9' then 'py -3'
+      const interpreters = [
+        { label: 'py -3.9', cmd: 'py', argsPrefix: ['-3.9'] },
+        { label: 'py -3', cmd: 'py', argsPrefix: ['-3'] }
+      ];
+
+      const attemptInterpreter = (index) => {
+        if (index >= interpreters.length) {
+          this.mainWindow.webContents.send('console-log', 'YOLO failed to start with all interpreters');
+          this.sarModeEnabled = false;
+          this.mainWindow.webContents.send('sar-stopped');
+          return;
+        }
+
+        const { label, cmd, argsPrefix } = interpreters[index];
+        const args = [...argsPrefix, ...baseArgs];
+        this.mainWindow.webContents.send('console-log', `Using Python interpreter: ${label}`);
+
+        const proc = spawn(cmd, args, { cwd: workingDir, stdio: ['pipe', 'pipe', 'pipe'] });
+        this.yoloProcess = proc;
+        attachYoloLogs(proc);
+
+        let attemptedFallback = false;
+
+        proc.on('error', (error) => {
+          console.error(`YOLO spawn error with ${label}:`, error);
+          this.mainWindow.webContents.send('console-log', `YOLO spawn error with ${label}: ${error.message}`);
+          if (!attemptedFallback) {
+            attemptedFallback = true;
+            attemptInterpreter(index + 1);
+          }
         });
-       
-       this.yoloProcess.on('error', (error) => {
-         console.error('YOLO spawn error:', error);
-         this.mainWindow.webContents.send('console-log', `YOLO spawn error: ${error.message}`);
-         this.mainWindow.webContents.send('sar-error', error.message);
-       });
-       
-       this.yoloProcess.on('close', (code) => {
-         console.log(`YOLO process exited with code ${code}`);
-         this.mainWindow.webContents.send('console-log', `YOLO process exited with code ${code}`);
-         this.sarModeEnabled = false;
-         this.mainWindow.webContents.send('sar-stopped');
-       });
-     }, 3000);
+
+        proc.on('close', (code) => {
+          const shouldFallback = code !== 0; // 103 from py means version missing
+          console.log(`YOLO process with ${label} exited with code ${code}`);
+          this.mainWindow.webContents.send('console-log', `YOLO process with ${label} exited with code ${code}`);
+          if (shouldFallback && !attemptedFallback) {
+            attemptedFallback = true;
+            attemptInterpreter(index + 1);
+          }
+        });
+      };
+
+      attemptInterpreter(0);
+    }, 3000);
 
     this.mainWindow.webContents.send('sar-started');
   }
@@ -1133,13 +1231,351 @@ class ForesightApp {
     ipcMain.on('get-status', (event) => {
       event.reply('status-update', {
         isCapturing: this.isCapturing,
-        sarModeEnabled: this.sarModeEnabled
+        sarModeEnabled: this.sarModeEnabled,
+        detectionLoggingEnabled: this.detectionLoggingEnabled
       });
     });
 
     ipcMain.on('update-yolo-region', (event, coordinates) => {
       this.updateYOLORegion(coordinates);
     });
+
+    // Toggle detection logging to SQLite
+    ipcMain.on('set-detection-logging', (event, enabled) => {
+      this.detectionLoggingEnabled = !!enabled;
+      event.reply('status-update', {
+        isCapturing: this.isCapturing,
+        sarModeEnabled: this.sarModeEnabled,
+        detectionLoggingEnabled: this.detectionLoggingEnabled
+      });
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Detection logging ${this.detectionLoggingEnabled ? 'enabled' : 'disabled'}`);
+    });
+
+    // Provide recent detection logs to renderer
+    ipcMain.on('get-detection-logs', (event, limit = 50) => {
+      try {
+        const rows = getRecentDetections(limit);
+        event.reply('detection-logs', rows);
+      } catch (err) {
+        event.reply('detection-logs', []);
+      }
+    });
+
+    // Face save directory settings
+    ipcMain.on('get-face-save-dir', (event) => {
+      event.reply('face-save-dir', this.faceSaveDir || null);
+    });
+    ipcMain.on('choose-face-save-dir', async (event) => {
+      try {
+        const res = await dialog.showOpenDialog(this.mainWindow, {
+          properties: ['openDirectory', 'createDirectory']
+        });
+        if (!res.canceled && res.filePaths && res.filePaths[0]) {
+          this.faceSaveDir = res.filePaths[0];
+          this.saveFaceSaveSettings();
+          event.reply('face-save-dir', this.faceSaveDir);
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder set to: ${this.faceSaveDir}`);
+        }
+      } catch (e) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', `Folder selection failed: ${e.message}`);
+      }
+    });
+    ipcMain.on('set-face-save-dir', (event, dirPath) => {
+      try {
+        if (dirPath) {
+          this.faceSaveDir = dirPath;
+          this.saveFaceSaveSettings();
+          event.reply('face-save-dir', this.faceSaveDir);
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder set to: ${this.faceSaveDir}`);
+        }
+      } catch (e) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to set folder: ${e.message}`);
+      }
+    });
+
+    // Provide detected images from configured folder (or default)
+    ipcMain.on('get-detected-images', (event, limit = 200) => {
+      const targetDir = this.faceSaveDir || 'C\\\\Users\\\\Asus\\\\Desktop\\\\Detected';
+      const payload = this._buildDetectedImagesPayload(targetDir, limit);
+      // Start or move watcher to this directory for real-time updates
+      this._attachGalleryWatcher(targetDir, limit);
+      event.reply('detected-images', payload);
+    });
+
+    // Receive phone mirror panel bounds from renderer to position embedded scrcpy
+    ipcMain.on('phone-mirror/bounds', (event, bounds) => {
+      try {
+        this.phoneMirrorBounds = bounds;
+        if (this.embedScrcpyEnabled) {
+          this.embedScrcpyWindow();
+        }
+      } catch (e) {
+        const now = Date.now();
+        if (now - this.lastEmbedErrorTs > 3000) {
+          this.lastEmbedErrorTs = now;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT][EMBED] bounds update failed: ${e.message}`);
+        }
+      }
+    });
+  }
+
+  _buildDetectedImagesPayload(targetDir, limit = 200) {
+    const fs = require('fs');
+    let files = [];
+    try {
+      const entries = fs.readdirSync(targetDir);
+      files = entries
+        .filter(name => /\.(jpg|jpeg|png|webp)$/i.test(name))
+        .map(name => path.join(targetDir, name));
+      files.sort((a, b) => {
+        try {
+          return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+        } catch {
+          return 0;
+        }
+      });
+      files = files.slice(0, limit);
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Gallery load failed: ${e.message}`);
+    }
+    return { dir: targetDir, files };
+  }
+
+  _attachGalleryWatcher(targetDir, limit = 200) {
+    const fs = require('fs');
+    try {
+      if (this.galleryWatcher && this.galleryWatchDir === targetDir) {
+        return; // Already watching this dir
+      }
+      // Close existing watcher
+      if (this.galleryWatcher) {
+        try { this.galleryWatcher.close(); } catch {}
+        this.galleryWatcher = null;
+      }
+      this.galleryWatchDir = targetDir;
+      // Debounce burst of events
+      let timer = null;
+      this.galleryWatcher = fs.watch(targetDir, { persistent: true }, (eventType, filename) => {
+        if (filename && /\.(jpg|jpeg|png|webp)$/i.test(filename)) {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            const payload = this._buildDetectedImagesPayload(targetDir, limit);
+            this.mainWindow && this.mainWindow.webContents.send('detected-images', payload);
+          }, 150);
+        }
+      });
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT] Gallery watching: ${targetDir}`);
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT] Gallery watch failed: ${e.message}`);
+    }
+  }
+
+  // --- scrcpy embed helpers (Windows) ---
+  embedScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const b = this.phoneMirrorBounds;
+    if (!b) return;
+    const { x, y, width, height } = b;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+          [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+          [DllImport("user32.dll")] public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      $mainWindow = Get-Process -Name "electron" | Where-Object {$_.MainWindowTitle -eq "Foresight"} | Select-Object -First 1
+      if (-not $proc -or -not $mainWindow) { exit 1 }
+      $GWL_STYLE = -16
+      $WS_CHILD = 0x40000000
+      $WS_VISIBLE = 0x10000000
+      $WS_POPUP = 0x80000000
+      $WS_OVERLAPPEDWINDOW = 0x00CF0000
+      $style = [Win32API]::GetWindowLong($proc.MainWindowHandle, $GWL_STYLE)
+      $newStyle = ($style -bor $WS_CHILD -bor $WS_VISIBLE) -band (-bnot ($WS_POPUP -bor $WS_OVERLAPPEDWINDOW))
+      [Win32API]::SetWindowLong($proc.MainWindowHandle, $GWL_STYLE, $newStyle) | Out-Null
+      [Win32API]::SetParent($proc.MainWindowHandle, $mainWindow.MainWindowHandle) | Out-Null
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, ${x}, ${y}, ${width}, ${height}, 0x0040) | Out-Null
+      Write-Host "EMBED_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, (error, stdout, stderr) => {
+      if (error) {
+        const now = Date.now();
+        if (now - this.lastEmbedErrorTs > 3000) {
+          this.lastEmbedErrorTs = now;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `[FORESIGHT][EMBED] error: ${error.message}`);
+        }
+        return;
+      }
+      const out = (stdout || '').toString().trim();
+      if (out.includes('EMBED_OK')) {
+        this.mainWindow && this.mainWindow.webContents.send('console-log', '[FORESIGHT][EMBED] embedded scrcpy into control panel');
+      }
+    });
+  }
+
+  startEmbedMonitor() {
+    if (this.embedMonitorInterval) return;
+    // Event-driven enforcement: keep scrcpy visually on top
+    if (this.mainWindow && !this.enforceZOrderAttached) {
+      this.mainWindow.on('focus', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('blur', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('move', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('resize', () => this.forceScrcpyTopMost());
+      this.mainWindow.on('show', () => { this.showScrcpyWindow(); this.forceScrcpyTopMost(); });
+      this.mainWindow.on('minimize', () => this.hideScrcpyWindow());
+      this.mainWindow.on('restore', () => { this.showScrcpyWindow(); this.forceScrcpyTopMost(); });
+      this.enforceZOrderAttached = true;
+    }
+
+    // Periodic enforcement to recover from any z-order drift
+    this.embedMonitorInterval = setInterval(() => {
+      if (!this.isCapturing || !this.scrcpyProcess) return;
+      this.embedScrcpyWindow();
+      this.forceScrcpyTopMost();
+    }, 250);
+  }
+
+  stopEmbedMonitor() {
+    if (this.embedMonitorInterval) {
+      clearInterval(this.embedMonitorInterval);
+      this.embedMonitorInterval = null;
+    }
+    // Note: listeners are lightweight; keep them until app stops capture
+  }
+
+  // Keep scrcpy window at the top of the control panel area
+  enforceScrcpyTop() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const b = this.phoneMirrorBounds;
+    if (!b) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # Z-order only: keep at top among siblings without moving, sizing, or activating
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr]::Zero, 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "ZTOP_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, (error, stdout, stderr) => {
+      // No noisy logging; this runs frequently
+    });
+  }
+
+  // Force global topmost so it always stays above control panel; tie visibility to main window
+  forceScrcpyTopMost() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+          [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      $GWL_STYLE = -16
+      $WS_CHILD = 0x40000000
+      # Ensure it is a top-level window (remove child style)
+      $style = [Win32API]::GetWindowLong($proc.MainWindowHandle, $GWL_STYLE)
+      if ($style -band $WS_CHILD) {
+        $newStyle = $style -band -bnot $WS_CHILD
+        [Win32API]::SetWindowLong($proc.MainWindowHandle, $GWL_STYLE, $newStyle) | Out-Null
+      }
+      # Make window topmost without activation
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      # HWND_TOPMOST = -1
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "TOPMOST_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
+  }
+
+  hideScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API { [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # SW_HIDE = 0
+      [Win32API]::ShowWindow($proc.MainWindowHandle, 0) | Out-Null
+      Write-Host "HIDE_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
+  }
+
+  showScrcpyWindow() {
+    if (!this.isCapturing || !this.scrcpyProcess) return;
+    const psCommand = `
+      Add-Type -TypeDefinition '
+        using System;
+        using System.Runtime.InteropServices;
+        public static class Win32API {
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+          [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        }
+      '
+      $proc = Get-Process -Name "scrcpy" -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq "Foresight Phone Mirror"} | Select-Object -First 1
+      if (-not $proc) { exit 1 }
+      # SW_SHOW = 5
+      [Win32API]::ShowWindow($proc.MainWindowHandle, 5) | Out-Null
+      # Restore topmost order
+      $SWP_NOSIZE = 0x0001
+      $SWP_NOMOVE = 0x0002
+      $SWP_NOACTIVATE = 0x0010
+      [Win32API]::SetWindowPos($proc.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE) | Out-Null
+      Write-Host "SHOW_OK"
+    `;
+    exec(`powershell -Command "${psCommand}"`, () => {});
+  }
+
+  loadFaceSaveSettings() {
+    const fs = require('fs');
+    const settingsPath = path.join(app.getPath('userData'), 'face_settings.json');
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        if (data && data.faceSaveDir) {
+          this.faceSaveDir = data.faceSaveDir;
+          this.mainWindow && this.mainWindow.webContents.send('console-log', `Face save folder loaded: ${this.faceSaveDir}`);
+        }
+      }
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to load face settings: ${e.message}`);
+    }
+  }
+
+  saveFaceSaveSettings() {
+    const fs = require('fs');
+    const settingsPath = path.join(app.getPath('userData'), 'face_settings.json');
+    try {
+      fs.writeFileSync(settingsPath, JSON.stringify({ faceSaveDir: this.faceSaveDir }, null, 2));
+    } catch (e) {
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Failed to save face settings: ${e.message}`);
+    }
   }
 }
 
@@ -1147,10 +1583,14 @@ class ForesightApp {
 console.log('Initializing Foresight App...');
 const foresightApp = new ForesightApp();
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const { dbPath } = await initDetectionDatabase();
+  console.log(`Detection database initialized at: ${dbPath}`);
   console.log('Electron app ready - creating main window...');
   foresightApp.createMainWindow();
   foresightApp.setupIpcHandlers();
+  // Load face save settings after window is ready
+  foresightApp.loadFaceSaveSettings();
   console.log('App initialization complete');
 
   app.on('activate', () => {
@@ -1170,4 +1610,5 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   foresightApp.cleanup();
+  closeDetectionDatabase();
 });
