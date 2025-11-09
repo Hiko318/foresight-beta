@@ -27,6 +27,45 @@ class ForesightApp {
     // Gallery watcher
     this.galleryWatcher = null;
     this.galleryWatchDir = null;
+    // Performance mode flag
+    this.performanceModeEnabled = false;
+  }
+
+  getFocusInterval() {
+    return this.performanceModeEnabled ? 1500 : 500;
+  }
+
+  getEmbedInterval() {
+    return this.performanceModeEnabled ? 600 : 250;
+  }
+
+  adjustMonitoringIntervals() {
+    // Focus monitor
+    this.clearFocusMonitoring();
+    if (this.overlayWindow) {
+      this.setupFocusMonitoring();
+    }
+    // Embed monitor
+    this.stopEmbedMonitor();
+    if (this.isCapturing && this.embedScrcpyEnabled) {
+      this.startEmbedMonitor();
+    }
+  }
+
+  boostProcessPriority(pid, level = 'AboveNormal') {
+    if (!pid) return;
+    const psCommand = `
+      try {
+        $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue
+        if ($p) { $p.PriorityClass = '${level}'; Write-Host 'PRIORITY_OK' } else { Write-Host 'NO_PROCESS' }
+      } catch { Write-Host 'PRIORITY_FAIL' }
+    `;
+    exec(`powershell -Command "${psCommand}"`, (error, stdout, stderr) => {
+      // Keep quiet to avoid log spam; only log failures in console
+      if (error) {
+        console.warn(`Priority boost failed for pid ${pid}: ${error.message}`);
+      }
+    });
   }
 
   createMainWindow() {
@@ -431,7 +470,7 @@ class ForesightApp {
 
     this.focusMonitorInterval = setInterval(() => {
       this.checkScrcpyFocus();
-    }, 500); // Check every 500ms
+    }, this.getFocusInterval());
   }
 
   clearFocusMonitoring() {
@@ -497,9 +536,9 @@ class ForesightApp {
     if (!this.isCapturing || !this.scrcpyProcess) return;
     
     const winWidth = 1498;
-    const winHeight = 937;
-    const scrcpyX = 1;
-    const scrcpyY = 128;
+    const winHeight = 936;
+    const scrcpyX = 139;
+    const scrcpyY = 119;
     
     // Maintain scrcpy position relative to screen, not main window
     const psCommand = `
@@ -536,9 +575,9 @@ class ForesightApp {
     if (!this.isCapturing || !this.scrcpyProcess) return;
     
     const winWidth = 1498;
-    const winHeight = 937;
-    const scrcpyX = 1;
-    const scrcpyY = 128;
+    const winHeight = 936;
+    const scrcpyX = 139;
+    const scrcpyY = 119;
     
     // Try multiple times to position the window
     let attempts = 0;
@@ -717,8 +756,8 @@ class ForesightApp {
       const scrcpyX = 1;
       const scrcpyY = 128;
       
-      // Start scrcpy process with calculated position and VSync settings
-      this.scrcpyProcess = spawn('scrcpy', [
+      // Start scrcpy process with calculated position and performance-aware settings
+      const baseArgs = [
         '-s', deviceId,
         '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
@@ -728,8 +767,14 @@ class ForesightApp {
         '--stay-awake',
         '--turn-screen-off',
         '--window-borderless',
-        '--max-fps=30'  // ChatGPT Fix #5: Tame FPS for stability (30 FPS reduces flicker)
-      ]);
+        '--max-fps=30'
+      ];
+      if (this.performanceModeEnabled) {
+        baseArgs.push('--bit-rate=6M');
+        baseArgs.push('--max-size=1152');
+        this.mainWindow.webContents.send('console-log', 'Performance Mode: scrcpy bitrate/max-size reduced');
+      }
+      this.scrcpyProcess = spawn('scrcpy', baseArgs);
       
       // After scrcpy initializes, embed it into the control panel
       setTimeout(() => {
@@ -812,6 +857,8 @@ class ForesightApp {
     
     if (this.sarModeEnabled) {
       console.log('Enabling SAR mode...');
+      // Notify renderer that SAR startup is beginning
+      this.mainWindow.webContents.send('sar-starting');
       await this.startYoloScrcpy();
     } else {
       console.log('Disabling SAR mode...');
@@ -833,6 +880,7 @@ class ForesightApp {
   async startYoloScrcpy() {
     console.log('Starting YOLO scrcpy window...');
     this.mainWindow.webContents.send('console-log', 'Starting YOLO scrcpy window...');
+    this.mainWindow.webContents.send('sar/progress', { percent: 10, message: 'Launching scrcpy…' });
     
     console.log('SAR mode will capture Foresight Phone Mirror window content');
     this.mainWindow.webContents.send('console-log', 'SAR mode capturing window: Foresight Phone Mirror');
@@ -840,14 +888,64 @@ class ForesightApp {
     // First, start scrcpy if not already running
     if (!this.scrcpyProcess) {
       this.mainWindow.webContents.send('console-log', 'Starting scrcpy for SAR mode...');
+
+      // Detect connected device via ADB and select the first one
+      let deviceId = null;
+      try {
+        await new Promise((resolve) => {
+          const adbCheck = spawn('adb', ['devices']);
+          let adbOutput = '';
+          adbCheck.stdout.on('data', (data) => {
+            adbOutput += data.toString();
+          });
+          adbCheck.stderr.on('data', (data) => {
+            console.error('ADB stderr:', data.toString());
+            this.mainWindow.webContents.send('console-log', `ADB error: ${data.toString()}`);
+          });
+          adbCheck.on('error', (error) => {
+            console.error('ADB not found:', error);
+            this.mainWindow.webContents.send('console-log', 'Error: ADB not found. Please install Android SDK Platform Tools.');
+            this.mainWindow.webContents.send('console-log', 'Download from: https://developer.android.com/studio/releases/platform-tools');
+            resolve();
+          });
+          adbCheck.on('close', (code) => {
+            if (code !== 0) {
+              this.mainWindow.webContents.send('console-log', 'Error: ADB command failed.');
+              resolve();
+              return;
+            }
+            const lines = adbOutput.split('\n');
+            const devices = lines.filter(line =>
+              line.trim() &&
+              !line.includes('List of devices attached') &&
+              line.includes('device')
+            );
+            if (devices.length === 0) {
+              this.mainWindow.webContents.send('console-log', "Can't detect device - USB debugging must be turned on");
+              this.mainWindow.webContents.send('console-log', 'Enable USB debugging in Developer options and authorize this PC.');
+            } else {
+              const deviceLine = devices[0].trim();
+              deviceId = deviceLine.split(/\s+/)[0];
+              this.mainWindow.webContents.send('console-log', `Device detected for SAR: ${deviceId}`);
+            }
+            resolve();
+          });
+        });
+      } catch (e) {
+        console.error('Failed to query ADB devices:', e);
+        this.mainWindow.webContents.send('console-log', `Failed to query ADB devices: ${e.message}`);
+      }
+      if (!deviceId) {
+        this.mainWindow.webContents.send('console-log', 'No deviceId resolved from ADB; starting scrcpy without -s');
+      }
       
       // Position scrcpy window to fit the UI exactly as specified
       const winWidth = 1498;
-      const winHeight = 937;
-      const scrcpyX = 1;
-      const scrcpyY = 128;
+    const winHeight = 936;
+    const scrcpyX = 139;
+    const scrcpyY = 119;
       
-      this.scrcpyProcess = spawn('scrcpy', [
+      const scrcpyArgs = [
         '--window-title=Foresight Phone Mirror',
         `--window-x=${scrcpyX}`,
         `--window-y=${scrcpyY}`,
@@ -855,8 +953,39 @@ class ForesightApp {
         `--window-height=${winHeight}`,
         '--stay-awake',
         '--turn-screen-off',
-        '--window-borderless'
-      ]);
+        '--window-borderless',
+        '--max-fps=30'
+      ];
+      if (deviceId) {
+        scrcpyArgs.unshift('-s', deviceId);
+      }
+      if (this.performanceModeEnabled) {
+        scrcpyArgs.push('--bit-rate=6M');
+        scrcpyArgs.push('--max-size=1152');
+        this.mainWindow.webContents.send('console-log', 'Performance Mode: scrcpy bitrate/max-size reduced (SAR)');
+      } else {
+        scrcpyArgs.push('--bit-rate=8M');
+        scrcpyArgs.push('--max-size=1280');
+      }
+      this.scrcpyProcess = spawn('scrcpy', scrcpyArgs);
+
+      // Raise scrcpy priority to keep UI responsive
+      this.boostProcessPriority(this.scrcpyProcess.pid, 'AboveNormal');
+
+      // Indicate scrcpy is starting
+      this.mainWindow.webContents.send('sar/progress', { percent: 25, message: 'Scrcpy process started' });
+
+      // Forward scrcpy logs for diagnostics
+      if (this.scrcpyProcess && this.scrcpyProcess.stdout) {
+        this.scrcpyProcess.stdout.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy: ${data.toString()}`);
+        });
+      }
+      if (this.scrcpyProcess && this.scrcpyProcess.stderr) {
+        this.scrcpyProcess.stderr.on('data', (data) => {
+          this.mainWindow.webContents.send('console-log', `scrcpy error: ${data.toString()}`);
+        });
+      }
       
       this.scrcpyProcess.on('error', (error) => {
         console.error('Scrcpy error:', error);
@@ -868,17 +997,29 @@ class ForesightApp {
       this.scrcpyProcess.on('close', (code) => {
         console.log(`Scrcpy process exited with code ${code}`);
         this.mainWindow.webContents.send('console-log', `Scrcpy process exited with code ${code}`);
-        if (this.yoloProcess) {
-          this.yoloProcess.kill();
-          this.yoloProcess = null;
-        }
-        this.sarModeEnabled = false;
-        this.mainWindow.webContents.send('sar-stopped');
-        this.stopEmbedMonitor();
-        // Close overlay window when scrcpy stops
-        if (this.overlayWindow) {
-          this.overlayWindow.close();
-          this.overlayWindow = null;
+        // Clear reference
+        this.scrcpyProcess = null;
+
+        // If SAR is still enabled, attempt automatic recovery
+        if (this.sarModeEnabled) {
+          this.mainWindow.webContents.send('console-log', 'Scrcpy exited unexpectedly; attempting automatic restart...');
+          // Do not kill YOLO here; let YOLO close handler decide restart if needed
+          setTimeout(() => {
+            this.startYoloScrcpy();
+          }, 1500);
+        } else {
+          // User-initiated stop: clean up
+          if (this.yoloProcess) {
+            this.yoloProcess.kill();
+            this.yoloProcess = null;
+          }
+          this.mainWindow.webContents.send('sar-stopped');
+          this.stopEmbedMonitor();
+          // Close overlay window when scrcpy stops
+          if (this.overlayWindow) {
+            this.overlayWindow.close();
+            this.overlayWindow = null;
+          }
         }
       });
     }
@@ -886,9 +1027,11 @@ class ForesightApp {
     // Create and show the Electron overlay window for flicker-free rendering
     if (!this.overlayWindow) {
       this.createOverlayWindow();
+      this.mainWindow.webContents.send('sar/progress', { percent: 35, message: 'Overlay window created' });
       // Position overlay to match scrcpy window
       setTimeout(() => {
         this.positionOverlayWindow();
+        this.mainWindow.webContents.send('sar/progress', { percent: 45, message: 'Overlay positioned' });
       }, 1000);
     }
     
@@ -897,10 +1040,12 @@ class ForesightApp {
       if (this.embedScrcpyEnabled) {
         this.embedScrcpyWindow();
         this.startEmbedMonitor();
+        this.mainWindow.webContents.send('sar/progress', { percent: 55, message: 'Embedding scrcpy window' });
       }
       const scriptPath = path.join(__dirname, '../scripts/yolo_detection.py');
       console.log(`Starting YOLO with script: ${scriptPath}`);
       this.mainWindow.webContents.send('console-log', `Starting YOLO with script: ${scriptPath}`);
+      this.mainWindow.webContents.send('sar/progress', { percent: 65, message: 'Starting YOLO pipeline' });
 
       const workingDir = path.join(__dirname, '..');
       const baseArgs = [
@@ -951,6 +1096,9 @@ class ForesightApp {
                   const savedPath = line.replace('FACE_SAVED:', '').trim();
                   this.mainWindow && this.mainWindow.webContents.send('console-log', `Face saved: ${savedPath}`);
                   this.mainWindow && this.mainWindow.webContents.send('face-saved', { path: savedPath, timestamp: new Date().toISOString() });
+                } else if (line.startsWith('FACE_SKIPPED_DUPLICATE:')) {
+                  const trackId = line.replace('FACE_SKIPPED_DUPLICATE:', '').trim();
+                  this.mainWindow && this.mainWindow.webContents.send('console-log', `Duplicate face skipped (track ${trackId})`);
                 }
               }
             } catch (_) {}
@@ -992,6 +1140,9 @@ class ForesightApp {
         this.yoloProcess = proc;
         attachYoloLogs(proc);
 
+        // Raise YOLO Python priority to balance compute without starving UI
+        this.boostProcessPriority(proc.pid, 'AboveNormal');
+
         let attemptedFallback = false;
 
         proc.on('error', (error) => {
@@ -1007,9 +1158,19 @@ class ForesightApp {
           const shouldFallback = code !== 0; // 103 from py means version missing
           console.log(`YOLO process with ${label} exited with code ${code}`);
           this.mainWindow.webContents.send('console-log', `YOLO process with ${label} exited with code ${code}`);
+          // Clear reference
+          this.yoloProcess = null;
+
           if (shouldFallback && !attemptedFallback) {
             attemptedFallback = true;
             attemptInterpreter(index + 1);
+            return;
+          }
+
+          // If SAR is enabled and scrcpy is running, attempt to restart YOLO automatically
+          if (this.sarModeEnabled && this.scrcpyProcess) {
+            this.mainWindow.webContents.send('console-log', 'YOLO exited; restarting automatically...');
+            setTimeout(() => attemptInterpreter(0), 1500);
           }
         });
       };
@@ -1018,6 +1179,7 @@ class ForesightApp {
     }, 3000);
 
     this.mainWindow.webContents.send('sar-started');
+    this.mainWindow.webContents.send('sar/progress', { percent: 100, message: 'SAR mode ready' });
   }
 
   updateScrcpyWindowBounds() {
@@ -1138,9 +1300,9 @@ class ForesightApp {
     // Scrcpy window is at (1, 128) with size 1498x937
     // Overlay should align with scrcpy window position
     const winWidth = 1498;
-    const winHeight = 937;
-    const scrcpyX = 1;
-    const scrcpyY = 128;
+    const winHeight = 936;
+    const scrcpyX = 139;
+    const scrcpyY = 119;
     
     this.overlayWindow.setBounds({
       x: scrcpyX,
@@ -1232,7 +1394,8 @@ class ForesightApp {
       event.reply('status-update', {
         isCapturing: this.isCapturing,
         sarModeEnabled: this.sarModeEnabled,
-        detectionLoggingEnabled: this.detectionLoggingEnabled
+        detectionLoggingEnabled: this.detectionLoggingEnabled,
+        performanceModeEnabled: this.performanceModeEnabled
       });
     });
 
@@ -1246,9 +1409,25 @@ class ForesightApp {
       event.reply('status-update', {
         isCapturing: this.isCapturing,
         sarModeEnabled: this.sarModeEnabled,
-        detectionLoggingEnabled: this.detectionLoggingEnabled
+        detectionLoggingEnabled: this.detectionLoggingEnabled,
+        performanceModeEnabled: this.performanceModeEnabled
       });
       this.mainWindow && this.mainWindow.webContents.send('console-log', `Detection logging ${this.detectionLoggingEnabled ? 'enabled' : 'disabled'}`);
+    });
+
+    // Performance Mode toggle
+    ipcMain.on('set-performance-mode', (event, enabled) => {
+      this.performanceModeEnabled = !!enabled;
+      // Apply live monitoring interval changes
+      this.adjustMonitoringIntervals();
+      // Inform renderer
+      event.reply('status-update', {
+        isCapturing: this.isCapturing,
+        sarModeEnabled: this.sarModeEnabled,
+        detectionLoggingEnabled: this.detectionLoggingEnabled,
+        performanceModeEnabled: this.performanceModeEnabled
+      });
+      this.mainWindow && this.mainWindow.webContents.send('console-log', `Performance Mode ${this.performanceModeEnabled ? 'enabled' : 'disabled'} (scrcpy/YOLO settings apply on next start)`);
     });
 
     // Provide recent detection logs to renderer
@@ -1437,7 +1616,7 @@ class ForesightApp {
       if (!this.isCapturing || !this.scrcpyProcess) return;
       this.embedScrcpyWindow();
       this.forceScrcpyTopMost();
-    }, 250);
+    }, this.getEmbedInterval());
   }
 
   stopEmbedMonitor() {

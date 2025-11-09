@@ -109,16 +109,19 @@ REM --------------------------------------------------------------
 REM Python dependencies (prefer venv)
 REM --------------------------------------------------------------
 set VENV_DIR=.venv
-if not exist "%VENV_DIR%\Scripts\activate.bat" (
+set "VENV_PY=%CD%\%VENV_DIR%\Scripts\python.exe"
+set "VENV_PIP=%CD%\%VENV_DIR%\Scripts\pip.exe"
+if not exist "%VENV_PY%" (
   echo Creating Python virtual environment...
   py -3 -m venv "%VENV_DIR%"
 )
-if exist "%VENV_DIR%\Scripts\activate.bat" (
-  echo Activating virtual environment and installing requirements...
-  call "%VENV_DIR%\Scripts\activate.bat"
-  py -3 -m pip install --upgrade pip >nul 2>&1
+if exist "%VENV_PY%" (
+  echo Using virtual environment for Python packages...
+  set "PYTHONNOUSERSITE=1"
+  set "PATH=%CD%\%VENV_DIR%\Scripts;%PATH%"
+  "%VENV_PY%" -m pip install --upgrade pip >nul 2>&1
   if exist "requirements.txt" (
-    py -3 -m pip install -r requirements.txt
+    "%VENV_PY%" -m pip install -r requirements.txt
   )
 ) else (
   echo Virtual environment not available, installing requirements globally...
@@ -133,24 +136,29 @@ REM --------------------------------------------------------------
 echo Checking critical Python packages...
 
 REM OpenCV (cv2)
-py -3 -c "import cv2" >nul 2>&1
+"%VENV_PY%" -c "import cv2" >nul 2>&1
 if errorlevel 1 (
   echo Installing OpenCV (opencv-python)...
-  py -3 -m pip install opencv-python
+  "%VENV_PY%" -m pip install --force-reinstall --no-cache-dir opencv-python
+  "%VENV_PY%" -c "import cv2" >nul 2>&1
+  if errorlevel 1 (
+    echo Retrying with OpenCV contrib build...
+    "%VENV_PY%" -m pip install --force-reinstall --no-cache-dir opencv-contrib-python
+  )
 )
 
 REM Ultralytics
-py -3 -c "import ultralytics" >nul 2>&1
+"%VENV_PY%" -c "import ultralytics" >nul 2>&1
 if errorlevel 1 (
   echo Installing Ultralytics YOLOv8...
-  py -3 -m pip install ultralytics
+  "%VENV_PY%" -m pip install ultralytics
 )
 
 REM Torch (CPU fallback if missing)
-py -3 -c "import torch" >nul 2>&1
+"%VENV_PY%" -c "import torch" >nul 2>&1
 if errorlevel 1 (
   echo Installing PyTorch (CPU wheels)... This may take a few minutes.
-  py -3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+  "%VENV_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 )
 
 REM --------------------------------------------------------------

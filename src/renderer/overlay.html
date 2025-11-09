@@ -32,17 +32,25 @@
         // ChatGPT recommendation: Store detections in ref-like structure
         let currentDetections = [];
         let animationId = null;
+        let needsRedraw = true;
+        let lastDrawTime = 0;
+        const maxFpsMs = 33; // cap ~30 FPS redraws
         
-        // Fixed YOLO region coordinates
-        const targetRegionX = 139;
-        const targetRegionY = 119;
-        const targetRegionWidth = 1498;
-        const targetRegionHeight = 936;
+        // Detection coordinates are relative to the captured window/frame.
+        // The overlay window is positioned and sized to match the capture,
+        // so we can draw boxes directly without additional region mapping.
         
-        // Set canvas size to match window
+        // Account for devicePixelRatio to align physical detection coords
+        let dpr = window.devicePixelRatio || 1;
         function resizeCanvas() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
+            dpr = window.devicePixelRatio || 1;
+            // Canvas resolution in physical pixels, but CSS size stays full window
+            canvas.style.width = '100vw';
+            canvas.style.height = '100vh';
+            canvas.width = Math.round(window.innerWidth * dpr);
+            canvas.height = Math.round(window.innerHeight * dpr);
+            needsRedraw = true;
+            requestRedraw();
         }
         
         resizeCanvas();
@@ -50,10 +58,14 @@
         
         // ChatGPT recommendation: Draw function with requestAnimationFrame
         function drawDetections() {
+            const now = Date.now();
+            // Throttle redraws and skip if nothing changed
+            if (!needsRedraw && (now - lastDrawTime) < maxFpsMs) {
+                animationId = null;
+                return;
+            }
             // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            // No interactive controls needed - using fixed coordinates
             
             // Draw current detections
             if (currentDetections && currentDetections.length > 0) {
@@ -76,39 +88,19 @@
                         return; // Skip invalid detection
                     }
                     
-                    // Transform coordinates from YOLO desktop capture to specific region
-                    // YOLO captures the entire desktop but we want to map to specific region:
-                    // Top-left (x, y): (1, 128)
-                    // Bottom-right (x, y): (1498, 1064)
-                    // Width × Height: 1498 × 937
-                    
-                    // Use dynamic target region coordinates
-                    // (these can be adjusted with keyboard controls)
-                    
-                    // Map YOLO desktop coordinates to the target region
-                    // First, check if detection is within our target region
-                    if (x1 >= targetRegionX && y1 >= targetRegionY && 
-                        x2 <= targetRegionX + targetRegionWidth && 
-                        y2 <= targetRegionY + targetRegionHeight) {
-                        
-                        // Convert desktop coordinates to region-relative coordinates
-                        x1 = x1 - targetRegionX;
-                        y1 = y1 - targetRegionY;
-                        x2 = x2 - targetRegionX;
-                        y2 = y2 - targetRegionY;
-                        
-                        // Scale to overlay canvas size
-                        const scaleX = canvas.width / targetRegionWidth;
-                        const scaleY = canvas.height / targetRegionHeight;
-                        
-                        x1 = x1 * scaleX;
-                        y1 = y1 * scaleY;
-                        x2 = x2 * scaleX;
-                        y2 = y2 * scaleY;
-                    } else {
-                        // Skip detections outside our target region
-                        return;
-                    }
+                    // Convert physical pixel coordinates to CSS pixels for drawing
+                    x1 = x1 / dpr;
+                    y1 = y1 / dpr;
+                    x2 = x2 / dpr;
+                    y2 = y2 / dpr;
+
+                    // Clamp to visible bounds to avoid drawing artifacts
+                    const cssW = canvas.width / dpr;
+                    const cssH = canvas.height / dpr;
+                    x1 = Math.max(0, Math.min(cssW, x1));
+                    y1 = Math.max(0, Math.min(cssH, y1));
+                    x2 = Math.max(0, Math.min(cssW, x2));
+                    y2 = Math.max(0, Math.min(cssH, y2));
                     
                     // Only draw if coordinates are within content area
                     if (x1 >= 0 && y1 >= 0 && x2 <= canvas.width && y2 <= canvas.height) {
@@ -135,16 +127,24 @@
                 });
             }
             
-            // Continue animation loop
-            animationId = requestAnimationFrame(drawDetections);
+            lastDrawTime = now;
+            needsRedraw = false;
+            // Stop the loop until next requested redraw
+            animationId = null;
         }
-        
-        // Start the animation loop
-        animationId = requestAnimationFrame(drawDetections);
+        function requestRedraw() {
+            if (!animationId) {
+                animationId = requestAnimationFrame(drawDetections);
+            }
+        }
+        // Kick off initial draw
+        requestRedraw();
         
         // Listen for detection updates from main process
         window.electronAPI?.onDetectionUpdate?.((detections) => {
             currentDetections = detections || [];
+            needsRedraw = true;
+            requestRedraw();
         });
         
         // Also listen for YOLO detections from the new system
@@ -152,6 +152,8 @@
             const { ipcRenderer } = window.require('electron');
             ipcRenderer.on('yolo-detections', (event, detections) => {
                 currentDetections = detections || [];
+                needsRedraw = true;
+                requestRedraw();
             });
         }
         

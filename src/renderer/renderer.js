@@ -41,6 +41,10 @@ class ForesightRenderer {
         this.dbLoggingToggle = document.getElementById('dbLogging');
         this.dbLogStatus = document.getElementById('dbLogStatus');
         
+        // Performance Mode
+        this.perfModeToggle = document.getElementById('perfMode');
+        this.perfStatus = document.getElementById('perfStatus');
+        
         // Status elements (removed loadingText as left panel is gone)
         
         // Detection log panel
@@ -64,6 +68,10 @@ class ForesightRenderer {
         this.phoneMirrorPanel = document.getElementById('phoneMirrorPanel');
         this.phoneMirrorArea = document.querySelector('.phone-mirror-area');
         this.liveFeedEl = document.querySelector('.live-feed');
+        // SAR loading overlay elements
+        this.sarLoadingOverlay = document.getElementById('sarLoadingOverlay');
+        this.sarProgressFill = document.getElementById('sarProgressFill');
+        this.sarProgressText = document.getElementById('sarProgressText');
 
         // Face save folder controls
         this.faceSavePathDisplay = document.getElementById('faceSavePath');
@@ -130,6 +138,17 @@ class ForesightRenderer {
         this.dbLoggingToggle.addEventListener('change', () => {
             this.toggleDbLogging();
         });
+
+        // Performance Mode toggle
+        if (this.perfModeToggle) {
+            this.perfModeToggle.addEventListener('change', () => {
+                const enabled = !!this.perfModeToggle.checked;
+                ipcRenderer.send('set-performance-mode', enabled);
+                this.logToConsole(`Performance Mode ${enabled ? 'enabled' : 'disabled'}`, 'info');
+                // Update immediately for status text
+                this.updateUI();
+            });
+        }
 
         // Console clear
         this.clearConsoleBtn.addEventListener('click', () => {
@@ -208,11 +227,16 @@ class ForesightRenderer {
         });
 
         // SAR Mode events
+        ipcRenderer.on('sar-starting', () => {
+            this.showSarLoading(true);
+            this.updateSarLoading(5, 'Preparing…');
+        });
         ipcRenderer.on('sar-started', () => {
             this.sarModeEnabled = true;
             this.updateUI();
             this.logToConsole('SAR mode enabled - YOLO detection active', 'success');
             this.sarOverlay.classList.remove('hidden');
+            this.showSarLoading(false);
         });
 
         ipcRenderer.on('sar-stopped', () => {
@@ -221,6 +245,12 @@ class ForesightRenderer {
             this.updateUI();
             this.logToConsole('SAR mode disabled', 'info');
             this.sarOverlay.classList.add('hidden');
+            this.showSarLoading(false);
+        });
+
+        ipcRenderer.on('sar/progress', (event, payload) => {
+            const { percent = 0, message = '' } = payload || {};
+            this.updateSarLoading(percent, message);
         });
 
         ipcRenderer.on('sar-error', (event, error) => {
@@ -235,6 +265,9 @@ class ForesightRenderer {
             this.isCapturing = status.isCapturing;
             this.sarModeEnabled = status.sarModeEnabled;
             this.detectionLoggingEnabled = !!status.detectionLoggingEnabled;
+            if (typeof status.performanceModeEnabled === 'boolean') {
+                this.perfModeToggle.checked = !!status.performanceModeEnabled;
+            }
             this.dbLoggingToggle.checked = this.detectionLoggingEnabled;
             this.updateUI();
         });
@@ -279,6 +312,21 @@ class ForesightRenderer {
             }
             this.renderGallery(dir, files);
         });
+    }
+
+    // SAR loading overlay helpers
+    showSarLoading(show) {
+        if (!this.sarLoadingOverlay) return;
+        this.sarLoadingOverlay.classList.toggle('hidden', !show);
+    }
+
+    updateSarLoading(percent, message) {
+        if (!this.sarProgressFill || !this.sarProgressText) return;
+        const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+        this.sarProgressFill.style.width = `${clamped}%`;
+        if (message) {
+            this.sarProgressText.textContent = message;
+        }
     }
 
     setupPhoneMirrorBoundsSync() {
@@ -390,6 +438,13 @@ class ForesightRenderer {
         // Update DB logging status
         this.dbLogStatus.textContent = this.detectionLoggingEnabled ? 'Enabled' : 'Disabled';
         this.dbLogStatus.style.color = this.detectionLoggingEnabled ? '#00ff88' : '#aaa';
+        
+        // Update Performance Mode status
+        const perfEnabled = !!(this.perfModeToggle && this.perfModeToggle.checked);
+        if (this.perfStatus) {
+            this.perfStatus.textContent = perfEnabled ? 'On' : 'Off';
+            this.perfStatus.style.color = perfEnabled ? '#00ff88' : '#aaa';
+        }
         
         // Removed loading text update (left panel removed)
 

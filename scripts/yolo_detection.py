@@ -65,17 +65,22 @@ except Exception as e:
 # - Do not upgrade TensorFlow/Keras; ignore their deprecation warnings
 # =============================================================
 SAVE_DIR = r"C:\Users\Asus\Desktop\Detected"
-PER_TRACK_COOLDOWN_S = 6
+# Use the same directory as the DeepFace DB for simplicity
+DB_DIR   = SAVE_DIR
+# Reduce the per-track minimal saver cooldown from 6s to 1s for snappier saves
+PER_TRACK_COOLDOWN_S = 1.0
 EMB_DB   = r"C:\Users\Asus\Desktop\Detected\faces.db"
 FACE_DETECTOR_BACKEND = "retinaface"
 DEEPFACE_MODEL, DEEPFACE_METRIC, DEEPFACE_THRESH = "ArcFace", "cosine", 0.33
 FRAMES_REQUIRED   = 5
 CAPTURE_TIMEOUT_S = 5.0
 SAME_PERSON_THRESH = 0.40  # tune 0.35–0.50
-DB_MATCH_THRESH    = 0.42
+# Stricter DB match to reduce false-duplicate flags; tune 0.33–0.40
+DB_MATCH_THRESH    = 0.36
+AHASH_HAMMING_THRESH = 11  # 0–64; lower is stricter
 MIN_FACE_SIZE = 40
 MIN_FACE_WH = 40
-BYPASS_DEEPFACE, FORCE_ALWAYS_SAVE = True, False
+BYPASS_DEEPFACE, FORCE_ALWAYS_SAVE = False, False
 LOG_PREFIX = "[FORESIGHT]"
 GLOBAL_WINDOW_OVERLAY = None
 
@@ -83,6 +88,8 @@ try:
     os.makedirs(SAVE_DIR, exist_ok=True)
     # Global per-track last save timestamps
     track_last_save = globals().get('track_last_save', {})
+    # Global per-track single-save guard to ensure only one minimal save per track
+    track_saved_once = globals().get('track_saved_once', {})
 except Exception as _e:
     print(f"{LOG_PREFIX}[SETUP]dir_err:{_e}", flush=True)
 try:
@@ -101,6 +108,9 @@ try:
     _cur  = _conn.cursor()
     _cur.execute("""CREATE TABLE IF NOT EXISTS faces(
       id INTEGER PRIMARY KEY, ts REAL, path TEXT, emb BLOB
+    )""")
+    _cur.execute("""CREATE TABLE IF NOT EXISTS faces_hash(
+      id INTEGER PRIMARY KEY, ts REAL, path TEXT, ahash TEXT
     )""")
     _conn.commit()
 except Exception as e:
@@ -135,6 +145,34 @@ def _cosine_dist(a,b):
         return 1.0 - float(np.dot(a,b)/d)
     except Exception:
         return 1.0
+
+def _ahash(bgr):
+    try:
+        import cv2
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA)
+        mean = float(np.mean(small))
+        bits = (small >= mean).astype(np.uint8).flatten()
+        val = 0
+        for i, bit in enumerate(bits):
+            if bit:
+                val |= (1 << (63 - i))
+        return f"{val:016x}"
+    except Exception as e:
+        print(f"{LOG_PREFIX} [AHASH][ERR] {repr(e)}")
+        return None
+
+def _hamming(a_hex, b_hex):
+    try:
+        if a_hex is None or b_hex is None:
+            return None
+        a = int(a_hex, 16)
+        b = int(b_hex, 16)
+        x = a ^ b
+        return bin(x).count('1')
+    except Exception as e:
+        print(f"{LOG_PREFIX} [HAMMING][ERR] {repr(e)}")
+        return None
 
 def _embed_one(bgr):
     try:
@@ -181,6 +219,63 @@ def _db_any_match_in_folder(emb, thr):
         print(f"{LOG_PREFIX} [DB][FOLDER_CHECK][ERR] {repr(e)}")
         return False
 
+def _db_any_hash_match_in_folder(ahash, hthr):
+    try:
+        if _cur is None or ahash is None:
+            return False
+        like_prefix = SAVE_DIR + '%'
+        for (h,) in _cur.execute("SELECT ahash FROM faces_hash WHERE path LIKE ? ORDER BY id DESC LIMIT 400", (like_prefix,)):
+            try:
+                d = _hamming(ahash, h)
+                if d is not None and d <= hthr:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception as e:
+        print(f"{LOG_PREFIX} [DB][HASH_FOLDER_CHECK][ERR] {repr(e)}")
+        return False
+
+def _db_best_match_distance(emb, folder_only=True, limit=300):
+    """Return the best (lowest) cosine distance among stored embeddings.
+    If folder_only is True, restrict to entries under SAVE_DIR. Returns None if DB empty or on error."""
+    try:
+        if _cur is None:
+            return None
+        best = None
+        if folder_only:
+            like_prefix = SAVE_DIR + '%'
+            rows = _cur.execute("SELECT emb FROM faces WHERE path LIKE ? ORDER BY id DESC LIMIT ?", (like_prefix, limit))
+        else:
+            rows = _cur.execute("SELECT emb FROM faces ORDER BY id DESC LIMIT ?", (limit,))
+        for (blob,) in rows:
+            try:
+                d = _cosine_dist(emb, np.frombuffer(blob, dtype=np.float32))
+                if best is None or d < best:
+                    best = d
+            except Exception:
+                continue
+        return best
+    except Exception as e:
+        print(f"{LOG_PREFIX} [DB][BEST_DIST][ERR] {repr(e)}")
+        return None
+
+def _db_any_hash_match(ahash, hthr):
+    try:
+        if _cur is None or ahash is None:
+            return False
+        for (h,) in _cur.execute("SELECT ahash FROM faces_hash ORDER BY id DESC LIMIT 600"):
+            try:
+                d = _hamming(ahash, h)
+                if d is not None and d <= hthr:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception as e:
+        print(f"{LOG_PREFIX} [DB][HASH_CHECK][ERR] {repr(e)}")
+        return False
+
 def _db_insert(path, emb):
     try:
         if _cur is None:
@@ -190,6 +285,16 @@ def _db_insert(path, emb):
         _conn.commit()
     except Exception as e:
         print(f"{LOG_PREFIX} [DB][INSERT][ERR] {repr(e)}")
+
+def _db_insert_hash(path, ahash):
+    try:
+        if _cur is None or ahash is None:
+            return
+        _cur.execute("INSERT INTO faces_hash(ts,path,ahash) VALUES(?,?,?)",
+                     (time.time(), path, ahash))
+        _conn.commit()
+    except Exception as e:
+        print(f"{LOG_PREFIX} [DB][INSERT_HASH][ERR] {repr(e)}")
 
 # -------------------------------------------------------------
 # Window handle helpers and state for scrcpy capture hardening
@@ -637,9 +742,14 @@ class YOLODetector:
         self.enable_face_save = False
         self.recent_frames = deque(maxlen=15)
         self.last_face_save_time = 0
-        self.face_save_cooldown = 5.0  # seconds
+        # Faster face save cooldown for verified saves (if enabled)
+        self.face_save_cooldown = 1.0  # seconds
         self.face_compare_limit = 20  # max existing images to compare (performance)
         self.face_compare_extensions = {'.jpg', '.jpeg', '.png'}
+        # Minimal saver (quick crops without dedup) should only run when
+        # face-save/dedup mode is disabled. Default to enabled, but we will
+        # turn it off when set_face_save_dir(enable=True) is called.
+        self.enable_minimal_saver = True
         # Background face save worker state
         self.save_worker_busy = False
         # DeepFace model cache (prepared asynchronously to avoid blocking detection loop)
@@ -695,10 +805,13 @@ class YOLODetector:
                 os.makedirs(dir_path, exist_ok=True)
                 self.face_save_dir = dir_path
                 self.enable_face_save = bool(enable)
+                # Keep minimal saver active to save immediately once per track
+                self.enable_minimal_saver = True
                 print(f"[INFO] Face save directory set: {dir_path} (enabled={self.enable_face_save})")
             else:
                 self.face_save_dir = None
                 self.enable_face_save = False
+                self.enable_minimal_saver = True
         except Exception as e:
             print(f"[ERROR] Failed to set face save dir: {e}")
 
@@ -1032,31 +1145,33 @@ class YOLODetector:
         print(f"{LOG_PREFIX} [TRACE][{tid}] frames={c}", flush=True)
 
         # Save cropped detection every CROP_SAVE_INTERVAL_S seconds per track
-        try:
-            now = time.time()
-            last = self.fs_last_crop_ts.get(tid, 0)
-            if now - last >= CROP_SAVE_INTERVAL_S:
-                x1, y1, x2, y2 = map(int, bbox)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                if x2 > x1 and y2 > y1:
-                    # Include green bounded box inside cropped image
-                    crop = frame[y1:y2, x1:x2].copy()
-                    try:
-                        import cv2
-                        cv2.rectangle(crop, (1, 1), (max(2, crop.shape[1]-2), max(2, crop.shape[0]-2)), (0, 255, 0), 2)
-                    except Exception:
-                        pass
-                    fname = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_t{tid}_crop.jpg"
-                    outp = os.path.join(SAVE_DIR, fname)
-                    try:
-                        ok = cv2.imwrite(outp, crop)
-                        print(f"{LOG_PREFIX} [CROP][SAVE] id={tid} -> {outp} ok={ok}")
-                    except Exception as e:
-                        print(f"{LOG_PREFIX} [CROP][ERR] id={tid} {e}")
-                self.fs_last_crop_ts[tid] = now
-        except Exception as e:
-            print(f"{LOG_PREFIX} [CROP][ERR] {e}")
+        # Only when minimal saver is enabled (to avoid repetitive saves under dedup mode)
+        if getattr(self, 'enable_minimal_saver', True):
+            try:
+                now = time.time()
+                last = self.fs_last_crop_ts.get(tid, 0)
+                if now - last >= CROP_SAVE_INTERVAL_S:
+                    x1, y1, x2, y2 = map(int, bbox)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                    if x2 > x1 and y2 > y1:
+                        # Include green bounded box inside cropped image
+                        crop = frame[y1:y2, x1:x2].copy()
+                        try:
+                            import cv2
+                            cv2.rectangle(crop, (1, 1), (max(2, crop.shape[1]-2), max(2, crop.shape[0]-2)), (0, 255, 0), 2)
+                        except Exception:
+                            pass
+                        fname = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_t{tid}_crop.jpg"
+                        outp = os.path.join(SAVE_DIR, fname)
+                        try:
+                            ok = cv2.imwrite(outp, crop)
+                            print(f"{LOG_PREFIX} [CROP][SAVE] id={tid} -> {outp} ok={ok}")
+                        except Exception as e:
+                            print(f"{LOG_PREFIX} [CROP][ERR] id={tid} {e}")
+                    self.fs_last_crop_ts[tid] = now
+            except Exception as e:
+                print(f"{LOG_PREFIX} [CROP][ERR] {e}")
         if c >= FRAMES_REQUIRED:
             def _job():
                 try:
@@ -1078,6 +1193,10 @@ class YOLODetector:
     # Minimal saver: no ML, no dedupe; crop and save per track with cooldown
     def on_detection(self, track_id, frame, bbox):
         try:
+            # If we already saved for this track, skip further minimal saves
+            if getattr(self, 'enable_minimal_saver', True):
+                if track_saved_once.get(track_id, False):
+                    return
             now = time.time()
             last = track_last_save.get(track_id, 0)
             if now - last >= PER_TRACK_COOLDOWN_S:
@@ -1091,11 +1210,65 @@ class YOLODetector:
                 except Exception:
                     pass
                 if crop.size and crop.shape[0] >= 40 and crop.shape[1] >= 40:
+                    # First check DB-based duplicate before saving (with detailed logging)
+                    is_dup = False
+                    emb = None
+                    cand_hash = None
+                    try:
+                        emb = _embed_one(crop)
+                    except Exception:
+                        emb = None
+                    try:
+                        cand_hash = _ahash(crop)
+                    except Exception:
+                        cand_hash = None
+                    if emb is None:
+                        # No embedding available; treat as new to avoid missing novel detections
+                        decision = 'new(no-emb)'
+                        best_folder = None
+                        best_global = None
+                    else:
+                        best_folder = _db_best_match_distance(emb, folder_only=True)
+                        best_global = _db_best_match_distance(emb, folder_only=False)
+                        folder_hash_dup = _db_any_hash_match_in_folder(cand_hash, AHASH_HAMMING_THRESH)
+                        global_hash_dup = _db_any_hash_match(cand_hash, AHASH_HAMMING_THRESH)
+                        emb_dup = (
+                            (best_folder is not None and best_folder <= DB_MATCH_THRESH) or 
+                            (best_global is not None and best_global <= DB_MATCH_THRESH)
+                        )
+                        # Require both signals to indicate duplicate
+                        is_dup = bool(emb_dup and (folder_hash_dup or global_hash_dup))
+                        decision = 'duplicate' if is_dup else 'new'
+                    try:
+                        print(f"{LOG_PREFIX}[DEDUP][track={track_id}] emb_folder_best={best_folder} emb_global_best={best_global} emb_thr={DB_MATCH_THRESH} hash_folder_dup={folder_hash_dup} hash_global_dup={global_hash_dup} hash_thr={AHASH_HAMMING_THRESH} decision={decision}", flush=True)
+                    except Exception:
+                        pass
+                    if is_dup:
+                        try:
+                            print(f"FACE_SKIPPED_DUPLICATE:{track_id}", flush=True)
+                        except Exception:
+                            pass
+                        track_last_save[track_id] = now
+                        track_saved_once[track_id] = True
+                        return
                     fname = f"{int(now)}_t{track_id}.jpg"
                     outp = os.path.join(SAVE_DIR, fname)
                     ok = cv2.imwrite(outp, crop)
                     print(f"[FORESIGHT][SAVE] {outp} ok={ok}")
                     track_last_save[track_id] = now
+                    track_saved_once[track_id] = True
+                    # Insert embedding to DB for future dedup across tracks
+                    try:
+                        if emb is None:
+                            emb = _embed_one(crop)
+                        if emb is not None:
+                            _db_insert(outp, emb)
+                        if cand_hash is None:
+                            cand_hash = _ahash(crop)
+                        if cand_hash is not None:
+                            _db_insert_hash(outp, cand_hash)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"{LOG_PREFIX} [on_detection ERROR] {e}", flush=True)
 
@@ -1136,20 +1309,57 @@ class YOLODetector:
             except Exception as _e:
                 print(f"{LOG_PREFIX}[UI] hide_loading_err:{_e}", flush=True)
             return
-        rep = faces[min(2, len(faces) - 1)]
-        if FORCE_ALWAYS_SAVE or BYPASS_DEEPFACE:
-            self._save_rep(tid, rep, "BYPASS" if BYPASS_DEEPFACE else "FORCE")
-            try:
-                show_loading(False)
-            except Exception as _e:
-                print(f"{LOG_PREFIX}[UI] hide_loading_err:{_e}", flush=True)
-            return
-        seen = self._check_in_db(rep)
-        print(f"{LOG_PREFIX}[FACE_JOB][{tid}]seen?{seen}", flush=True)
-        if not seen:
-            self._save_rep(tid, rep, "NEW")
+        # Choose representative face or fallback to last crop from burst
+        if faces:
+            rep = faces[min(2, len(faces) - 1)]
         else:
-            print(f"{LOG_PREFIX}[FACE_JOB][{tid}]skip(existing)", flush=True)
+            try:
+                f_last, b_last = frames_burst[-1]
+                x1, y1, x2, y2 = map(int, b_last)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(f_last.shape[1], x2), min(f_last.shape[0], y2)
+                rep = f_last[y1:y2, x1:x2].copy()
+            except Exception:
+                rep = frames_burst[-1][0]
+        # First, try fast embedding-based dedup (no DeepFace dependency)
+        try:
+            rep_emb = _embed_one(rep)
+        except Exception:
+            rep_emb = None
+        if rep_emb is not None:
+            try:
+                # Compute perceptual hash and require consensus to mark as duplicate
+                try:
+                    rep_hash = _ahash(rep)
+                except Exception:
+                    rep_hash = None
+                emb_dup = (_db_any_match_in_folder(rep_emb, DB_MATCH_THRESH) or _db_any_match(rep_emb, DB_MATCH_THRESH))
+                hash_dup = (_db_any_hash_match_in_folder(rep_hash, AHASH_HAMMING_THRESH) or _db_any_hash_match(rep_hash, AHASH_HAMMING_THRESH))
+                if emb_dup and hash_dup:
+                    print(f"{LOG_PREFIX}[FACE_JOB][{tid}]skip(existing-emb)", flush=True)
+                    try:
+                        print(f"FACE_SKIPPED_DUPLICATE:{tid}", flush=True)
+                    except Exception:
+                        pass
+                else:
+                    self._save_rep(tid, rep, "NEW")
+            except Exception as _e:
+                print(f"{LOG_PREFIX}[FACE_JOB][{tid}]emb_check_err:{_e}", flush=True)
+        else:
+            # Fallback: use DeepFace DB check if available; otherwise save once
+            if FORCE_ALWAYS_SAVE or BYPASS_DEEPFACE:
+                self._save_rep(tid, rep, "BYPASS" if BYPASS_DEEPFACE else "FORCE")
+            else:
+                seen = self._check_in_db(rep)
+                print(f"{LOG_PREFIX}[FACE_JOB][{tid}]seen?{seen}", flush=True)
+                if not seen:
+                    self._save_rep(tid, rep, "NEW")
+                else:
+                    print(f"{LOG_PREFIX}[FACE_JOB][{tid}]skip(existing)", flush=True)
+                    try:
+                        print(f"FACE_SKIPPED_DUPLICATE:{tid}", flush=True)
+                    except Exception:
+                        pass
         try:
             show_loading(False)
         except Exception as _e:
@@ -1167,6 +1377,17 @@ class YOLODetector:
             try:
                 cv2.imwrite(os.path.join(DB_DIR, fn), img)
                 print(f"FACE_SAVED:{p}", flush=True)
+                # Also insert embedding into SQLite DB for fast dedup across sessions
+                try:
+                    emb = _embed_one(img)
+                    if emb is not None:
+                        _db_insert(p, emb)
+                    # Insert perceptual hash for robust dedup consensus
+                    h = _ahash(img)
+                    if h is not None:
+                        _db_insert_hash(p, h)
+                except Exception as _e:
+                    print(f"{LOG_PREFIX} [DB][EMB_INSERT][ERR] {repr(_e)}", flush=True)
             except Exception as e:
                 print(f"{LOG_PREFIX}[DB_SAVE][{tid}]err:{e}", flush=True)
 
@@ -1218,8 +1439,37 @@ class YOLODetector:
         try:
             if not self.face_save_dir:
                 return False
+            # Compute perceptual hash upfront
+            try:
+                cand_hash = _ahash(candidate_img)
+            except Exception:
+                cand_hash = None
+            # Always attempt a fast embedding DB check first (works even without DeepFace)
+            try:
+                emb = _embed_one(candidate_img)
+            except Exception:
+                emb = None
+            if emb is not None:
+                try:
+                    best_folder = _db_best_match_distance(emb, folder_only=True)
+                    best_global = _db_best_match_distance(emb, folder_only=False)
+                    # Hash consensus
+                    folder_hash_dup = _db_any_hash_match_in_folder(cand_hash, AHASH_HAMMING_THRESH)
+                    global_hash_dup = _db_any_hash_match(cand_hash, AHASH_HAMMING_THRESH)
+                    emb_dup = (
+                        (best_folder is not None and best_folder <= DB_MATCH_THRESH) or
+                        (best_global is not None and best_global <= DB_MATCH_THRESH)
+                    )
+                    # Require consensus: both embedding and hash indicate duplicate
+                    is_dup = bool(emb_dup and (folder_hash_dup or global_hash_dup))
+                    print(f"{LOG_PREFIX}[DEDUP][face] emb_folder_best={best_folder} emb_global_best={best_global} emb_thr={DB_MATCH_THRESH} hash_folder_dup={folder_hash_dup} hash_global_dup={global_hash_dup} hash_thr={AHASH_HAMMING_THRESH} decision={'duplicate' if is_dup else 'new'}", flush=True)
+                    if is_dup:
+                        return True
+                except Exception:
+                    pass
+
+            # If DeepFace is not ready yet, rely solely on embedding check above
             if not self._df_model_ready or not self._df_module:
-                # If DeepFace is not ready yet, skip duplicate check (avoid blocking)
                 return False
             DeepFace = self._df_module
             # Collect existing image paths
@@ -1249,6 +1499,7 @@ class YOLODetector:
                         # One match is enough to mark as duplicate
                         print(f"[INFO] Folder duplicate matched: {os.path.basename(path)}")
                         print(f"[INFO] DeepFace folder compare: compared={compared}, matches={matches}")
+                        print("FACE_SKIPPED_DUPLICATE: deepface-folder", flush=True)
                         return True
                 except Exception as e:
                     # Ignore per-file errors, continue
@@ -1843,7 +2094,8 @@ class YOLODetector:
                 self.data_detection_cache = None
                 self.data_last_detection_time = 0
                 self.data_frame_skip_counter = 0
-                self.data_detection_interval = 1/15  # 15 FPS inference as recommended by ChatGPT
+                # Increase detection publishing to 30 FPS to improve overlay responsiveness
+                self.data_detection_interval = 1/30
                 # TTL persistence: Hold detections for 250-300ms to prevent flicker
                 self.TTL = 0.30  # 300ms TTL as recommended by ChatGPT
                 self.last_boxes = []
@@ -2382,13 +2634,23 @@ def _process_burst(track_id):
     rep_crop = crops[rep_idx]
     rep_emb  = embs[min(rep_idx, len(embs)-1)]
 
-    if _db_any_match(rep_emb, DB_MATCH_THRESH):
+    # Compute hash and require consensus with embedding to skip
+    try:
+        rep_hash = _ahash(rep_crop)
+    except Exception:
+        rep_hash = None
+    emb_dup_global = _db_any_match(rep_emb, DB_MATCH_THRESH)
+    emb_dup_folder = _db_any_match_in_folder(rep_emb, DB_MATCH_THRESH)
+    hash_dup_global = _db_any_hash_match(rep_hash, AHASH_HAMMING_THRESH)
+    hash_dup_folder = _db_any_hash_match_in_folder(rep_hash, AHASH_HAMMING_THRESH)
+    is_dup = (emb_dup_global or emb_dup_folder) and (hash_dup_global or hash_dup_folder)
+    print(f"{LOG_PREFIX} [BURST-DEDUP] emb_global={emb_dup_global} emb_folder={emb_dup_folder} hash_global={hash_dup_global} hash_folder={hash_dup_folder} decision={'duplicate' if is_dup else 'new'}")
+    if is_dup:
         print(f"{LOG_PREFIX} [SAVE] id={track_id} duplicate -> skip")
-        return
-
-    # Check within the specified folder (SAVE_DIR) for any similarities
-    if _db_any_match_in_folder(rep_emb, DB_MATCH_THRESH):
-        print(f"{LOG_PREFIX} [SAVE] id={track_id} folder-duplicate -> skip")
+        try:
+            print(f"FACE_SKIPPED_DUPLICATE:{track_id}", flush=True)
+        except Exception:
+            pass
         return
 
     fname = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_t{track_id}.jpg"
@@ -2397,6 +2659,13 @@ def _process_burst(track_id):
     print(f"{LOG_PREFIX} [SAVE] id={track_id} -> {outp} ok={ok}")
     if ok:
         _db_insert(outp, rep_emb)
+        try:
+            if rep_hash is None:
+                rep_hash = _ahash(rep_crop)
+        except Exception:
+            rep_hash = None
+        if rep_hash is not None:
+            _db_insert_hash(outp, rep_hash)
 
 class WindowCapture:
     def __init__(self, window_title="Foresight Phone Mirror"):
@@ -2763,11 +3032,12 @@ def main():
                         if detector._is_person_detection(d):
                             seen_tids.add(tid)
                             detector._on_detection(tid, frame, bbox)
-                        # Always run the minimal saver with per-track cooldown
-                        try:
-                            detector.on_detection(tid, frame, bbox)
-                        except Exception as e:
-                            print(f"{LOG_PREFIX} [on_detection ERROR] {e}", flush=True)
+                        # Run the minimal saver only when explicitly enabled
+                        if getattr(detector, 'enable_minimal_saver', True):
+                            try:
+                                detector.on_detection(tid, frame, bbox)
+                            except Exception as e:
+                                print(f"{LOG_PREFIX} [on_detection ERROR] {e}", flush=True)
                     # Reset counters for tracks not seen (only affects person tracks)
                     try:
                         detector._init_foresight_tracking()

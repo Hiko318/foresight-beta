@@ -42,6 +42,14 @@
                         </div>
                         <span id="dbLogStatus" class="status-text">Disabled</span>
                     </div>
+                    <div class="sar-toggle">
+                        <label class="toggle-label">Performance Mode</label>
+                        <div class="toggle-switch">
+                            <input type="checkbox" id="perfMode" class="toggle-input">
+                            <label for="perfMode" class="toggle-slider"></label>
+                        </div>
+                        <span id="perfStatus" class="status-text">Off</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -59,6 +67,16 @@
                             <div class="placeholder-icon">📱</div>
                             <h3>Phone Mirror</h3>
                             <p>Click "Start Capture" to begin phone mirroring</p>
+                        </div>
+                    </div>
+                    <!-- SAR Loading Overlay -->
+                    <div id="sarLoadingOverlay" class="loading-overlay hidden">
+                        <div class="loading-content">
+                            <div class="loading-title">Starting SAR Mode…</div>
+                            <div class="progress-bar">
+                                <div id="sarProgressFill" class="progress-fill" style="width:0%"></div>
+                            </div>
+                            <div id="sarProgressText" class="progress-text">Preparing…</div>
                         </div>
                     </div>
                     <div id="sarOverlay" class="sar-overlay hidden">
